@@ -1,0 +1,3 @@
+# Wide lines, as the code was written. `cargo fmt` before committing (scripts/check.sh checks it).
+max_width = 140
+use_small_heuristics = "Max"

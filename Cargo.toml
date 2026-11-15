@@ -1,0 +1,41 @@
+[package]
+name = "romgetter"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0.104"
+directories = "6.0.0"
+futures-util = "0.3.34"
+ratatui = "0.30.2"
+reqwest = { version = "0.13.5", features = ["json", "multipart", "stream", "query", "form", "gzip", "brotli"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+sevenz-rust2 = { version = "0.25.0", default-features = false, features = ["util"] }
+tokio = { version = "1.54.1", features = ["full"] }
+toml = "1.2.1"
+urlencoding = "2.1.3"
+zip = { version = "2.4.2", default-features = false, features = ["deflate"] }
+
+# Lint policy. `scripts/check.sh` runs clippy with warnings as errors.
+[lints.rust]
+unsafe_code = "forbid"
+unused_qualifications = "warn"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+# Pedantic lints that don't fit this codebase:
+doc_markdown = "allow"                # docs name products (TorBox, RetroDECK, No-Intro) everywhere
+cast_possible_truncation = "allow"    # progress / size / percentage math across u64, usize, f64
+cast_precision_loss = "allow"
+cast_sign_loss = "allow"
+cast_possible_wrap = "allow"
+too_many_lines = "allow"              # App's event and key handlers are long matches
+struct_excessive_bools = "allow"      # App state flags
+map_unwrap_or = "allow"               # `.map(f).unwrap_or(x)` reads fine
+unreadable_literal = "allow"          # the long literals are IDs (Metacritic, TorBox) and exact sizes in tests
+# A few nursery lints worth having:
+redundant_clone = "warn"
+or_fun_call = "warn"
+needless_collect = "warn"
