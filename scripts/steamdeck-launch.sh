@@ -46,5 +46,16 @@ EOF
 
 # If romgetter exits with an error, keep the window open so the message can be read
 # (press A/Enter to return to Steam).
-exec konsole --separate --profile romgetter --fullscreen --hide-menubar --hide-tabbar \
-    -e bash -c '"$1" || { echo; read -rp "romgetter exited with an error. Press Enter to close."; }' _ "$bin"
+konsole --separate --profile romgetter --fullscreen --hide-menubar --hide-tabbar \
+    -e bash -c '"$1" || { echo; read -rp "romgetter exited with an error. Press Enter to close."; }' _ "$bin" || true
+
+# Konsole runs podman at startup (to look for distrobox/toolbox containers), which leaves
+# podman's "catatonit -P" pause process behind. Steam's reaper counts the game as running
+# until every process it started has exited, so the shortcut would never close. Under
+# Steam we're the reaper's only child, so whatever else is under it is a leftover.
+if [[ "$(ps -o comm= -p "$PPID" 2>/dev/null)" == reaper ]]; then
+    for pid in $(pgrep -P "$PPID"); do
+        if [[ "$pid" != "$$" ]]; then kill "$pid" 2>/dev/null || true; fi
+    done
+fi
+exit 0
