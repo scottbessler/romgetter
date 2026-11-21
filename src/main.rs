@@ -45,7 +45,11 @@ async fn main() -> Result<()> {
     let (local_tx, mut local_rx) = tokio::sync::mpsc::unbounded_channel();
 
     // `romgetter search <query...>`: headless search (no TorBox, no library changes).
-    let args: Vec<String> = std::env::args().skip(1).collect();
+    let mut args: Vec<String> = std::env::args().skip(1).collect();
+    // `--gamepad`: read controller input from /dev/input (the Steam shortcut's launcher passes
+    // it). Off by default so a session over SSH ignores the pad of whoever's holding the Deck.
+    let use_gamepad = args.iter().any(|a| a == "--gamepad");
+    args.retain(|a| a != "--gamepad");
     // `romgetter scan`: sync the library with the roms folder and report.
     if args.first().map(String::as_str) == Some("scan") {
         let ctx = jobs::Ctx { torbox: None, rd: None, ..ctx };
@@ -183,7 +187,8 @@ async fn main() -> Result<()> {
     let mut app = App::new(cfg, paths.cache_dir.clone(), lib, tx, local_tx, ctx);
     app.config_file = Some(paths.config_file.clone());
 
-    let mut pad = gamepad::Gamepad::start();
+    let mut pad = if use_gamepad { gamepad::Gamepad::start() } else { gamepad::Gamepad::disabled() };
+    let mut pad_was_connected = false;
     let mut terminal = ratatui::init();
     let _ = execute!(std::io::stdout(), EnableBracketedPaste);
     let res: Result<()> = (|| {
@@ -197,12 +202,18 @@ async fn main() -> Result<()> {
             while let Some(p) = pad.poll() {
                 app.on_pad(p);
             }
-            app.pad = pad.connected();
+            // Show buttons when a pad shows up; keys once it's gone. In between, whichever was
+            // used last wins (see App::on_event / on_pad).
+            let connected = pad.connected();
+            if connected != pad_was_connected {
+                app.pad = connected;
+                pad_was_connected = connected;
+            }
             app.tick();
             terminal.draw(|f| ui::draw(f, &mut app))?;
             // Blocking poll is fine: the multi-threaded runtime keeps background tasks going.
             // Shorter with a controller, whose input arrives outside this poll.
-            let wait = Duration::from_millis(if app.pad { 30 } else { 100 });
+            let wait = Duration::from_millis(if pad_was_connected { 30 } else { 100 });
             if tokio::task::block_in_place(|| event::poll(wait))? {
                 app.on_event(event::read()?);
             }

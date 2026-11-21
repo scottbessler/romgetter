@@ -438,8 +438,12 @@ pub struct App {
 
     pub status: String,
     pub quit: bool,
-    /// A controller is connected: the help line shows buttons instead of keys.
+    /// The controller was used last (and is still connected): the help line shows buttons
+    /// instead of keys. A keypress flips it back, so SSHing in while a pad is plugged in works.
     pub pad: bool,
+    /// The text box was opened from the controller, so its typing comes from Steam's on-screen
+    /// keyboard as key events and shouldn't switch the help line back to keys.
+    pad_typing: bool,
     pub menu: Option<Menu>,
     pub tex: TexTab,
     /// Where `cfg` came from, for saving settings changed in the app (None in tests).
@@ -534,6 +538,7 @@ impl App {
             status: String::new(),
             quit: false,
             pad: false,
+            pad_typing: false,
             menu: None,
             tex,
             config_file: None,
@@ -2214,7 +2219,13 @@ impl App {
 
     pub fn on_event(&mut self, ev: Event) {
         match ev {
-            Event::Key(k) if k.kind != KeyEventKind::Release => self.on_key(k),
+            Event::Key(k) if k.kind != KeyEventKind::Release => {
+                if !(self.editing && self.pad_typing) {
+                    self.pad = false;
+                    self.pad_typing = false;
+                }
+                self.on_key(k)
+            }
             Event::Paste(s) if self.editing => {
                 self.current_input().push_str(s.trim_end_matches(['\n', '\r']));
                 self.after_input_change();
@@ -2227,6 +2238,12 @@ impl App {
     /// its menu of actions, Y the tab's menu, X searches, LB/RB switch tabs, LT/RT page. Buttons do the same thing whether or not
     /// a text box or menu is open.
     pub fn on_pad(&mut self, p: Pad) {
+        self.pad = true;
+        self.on_pad_inner(p);
+        self.pad_typing = self.editing;
+    }
+
+    fn on_pad_inner(&mut self, p: Pad) {
         use KeyCode as K;
         if self.menu.is_some() {
             let code = match p {
@@ -3242,6 +3259,23 @@ mod tests {
         assert!(app.cfg.use_vimm);
         assert!(Config::load(&path).unwrap().use_vimm);
         let _ = std::fs::remove_file(&path);
+    }
+
+    /// The help line follows whichever input was used last; on-screen-keyboard typing in a
+    /// box the pad opened doesn't count as the keyboard.
+    #[tokio::test]
+    async fn help_follows_last_input() {
+        let mut app = test_app(games("snes", 5));
+        app.tab = Tab::Library;
+        app.editing = false;
+        app.on_pad(Pad::Down);
+        assert!(app.pad);
+        app.on_event(Event::Key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)));
+        assert!(!app.pad);
+        app.on_pad(Pad::X);
+        assert!(app.pad && app.editing);
+        app.on_event(Event::Key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE)));
+        assert!(app.pad, "Steam keyboard typing keeps button hints");
     }
 
     /// The item menu draws as a popup over the list.

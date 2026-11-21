@@ -47,7 +47,7 @@ EOF
 # If romgetter exits with an error, keep the window open so the message can be read
 # (press A/Enter to return to Steam).
 konsole --separate --profile romgetter --fullscreen --hide-menubar --hide-tabbar \
-    -e bash -c '"$1" || { echo; read -rp "romgetter exited with an error. Press Enter to close."; }' _ "$bin" || true
+    -e bash -c '"$1" "$2" || { echo; read -rp "romgetter exited with an error. Press Enter to close."; }' _ "$bin" --gamepad || true
 
 # Konsole runs podman at startup (to look for distrobox/toolbox containers), which leaves
 # podman's "catatonit -P" pause process behind. Steam's reaper counts the game as running

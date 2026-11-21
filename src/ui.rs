@@ -368,6 +368,11 @@ fn draw_pack_about(f: &mut Frame, p: &crate::textures::Pack, area: Rect) {
         first.push(s);
     }
     let mut lines = vec![Line::from(first)];
+    // the list's one-line description stands in when the page had no overview
+    if p.about.is_empty() && !p.summary.is_empty() {
+        lines.push(Line::raw(""));
+        lines.push(Line::styled(p.summary.clone(), Style::new().fg(Color::Gray).italic()));
+    }
     for para in &p.about {
         lines.push(Line::raw(""));
         lines.push(Line::raw(para.clone()));
@@ -408,11 +413,7 @@ fn draw_textures(f: &mut Frame, app: &mut App, area: Rect) {
                 if !detail.is_empty() {
                     spans.push(Span::styled(format!("  {detail}"), DIM));
                 }
-                let mut lines = vec![Line::from(spans)];
-                if !p.summary.is_empty() {
-                    lines.push(Line::styled(format!("{:15}{}", "", p.summary), Style::new().fg(Color::Gray).italic()));
-                }
-                ListItem::new(lines)
+                ListItem::new(Line::from(spans))
             }
         })
         .collect();
@@ -423,7 +424,7 @@ fn draw_textures(f: &mut Frame, app: &mut App, area: Rect) {
         _ => None,
     });
     let (area, about) = match &picked {
-        Some(p) if !p.about.is_empty() || p.status.is_some() || p.region.is_some() => {
+        Some(p) if !p.about.is_empty() || !p.summary.is_empty() || p.status.is_some() || p.region.is_some() => {
             let [list, about] = Layout::vertical([Constraint::Min(6), Constraint::Length(9)]).areas(area);
             (list, Some(about))
         }

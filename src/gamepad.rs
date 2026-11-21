@@ -65,6 +65,12 @@ impl Gamepad {
         Gamepad { rx, open, held: None }
     }
 
+    /// Never reports a pad or a press (controller input not enabled).
+    pub fn disabled() -> Self {
+        let (_tx, rx) = mpsc::channel();
+        Gamepad { rx, open: Arc::new(Mutex::new(HashSet::new())), held: None }
+    }
+
     pub fn connected(&self) -> bool {
         !self.open.lock().unwrap().is_empty()
     }
