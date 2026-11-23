@@ -1,4 +1,4 @@
-use crate::app::{App, LIB_GROUP_LIMIT, LibInput, Menu, Remote, Row, Tab, TexRow};
+use crate::app::{App, LIB_GROUP_LIMIT, LibInput, Menu, Remote, Row, SearchRow, SetRow, SetState, Tab, TexRow};
 use crate::jobs::LocalState;
 use crate::systems;
 use ratatui::Frame;
@@ -48,7 +48,8 @@ pub fn draw(f: &mut Frame, app: &mut App) {
             Tab::Library if active > 0 => format!("{} ({} ⇣{active})", t.title(), app.lib.games.len()),
             Tab::Library => format!("{} ({})", t.title(), app.lib.games.len()),
             Tab::Textures if !app.tex.jobs.is_empty() => format!("{} (⇣{})", t.title(), app.tex.jobs.len()),
-            Tab::Search | Tab::Textures => t.title().to_string(),
+            Tab::Sources if app.busy() => format!("{} (indexing {})", t.title(), app.sets.len() - app.indexed_sets()),
+            Tab::Search | Tab::Textures | Tab::Sources => t.title().to_string(),
         }))
         .select(idx)
         .highlight_style(Style::new().fg(Color::Cyan).bold().underlined()),
@@ -59,6 +60,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         Tab::Search => draw_search(f, app, body),
         Tab::Library => draw_library(f, app, body),
         Tab::Textures => draw_textures(f, app, body),
+        Tab::Sources => draw_sources(f, app, body),
     }
 
     f.render_widget(Paragraph::new(app.status.as_str()).fg(Color::Yellow), status);
@@ -70,10 +72,13 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         "typing: Enter submit · Esc/↓ to list · Tab next tab · Ctrl-C quit"
     } else {
         match app.tab {
-            Tab::Search => "Enter/a add to library · Space actions · s/S change system · / search · m menu · Tab library · q quit",
-            Tab::Library => {
-                "Enter download/open · Space actions · m menu · D download all ready · t add Metacritic top 20 · ←→ fold · d direct · p paste · / filter · s system · o sort name/size · x remove · X delete from disk · r rescan · q quit"
+            Tab::Search => {
+                "Enter add / pick a source · a add best · Space actions · ←→ fold · S change system · s or / search · m menu · Tab library · q quit"
             }
+            Tab::Library => {
+                "Enter download/open · Space actions · m menu · D download all ready · t add Metacritic top 20 · ←→ fold · d direct · p paste · / filter · s search · S system · o sort name/size · x remove · X delete from disk · r rescan · q quit"
+            }
+            Tab::Sources => "Enter open group / set actions · ←→ fold · m menu · s search · Tab next tab · q quit",
             Tab::Textures => {
                 "Enter install / turn on·off · Space actions (pick a build) · m menu · r refresh the pack lists · Tab next tab · q quit"
             }
@@ -118,9 +123,10 @@ fn pad_help(app: &App) -> &'static str {
         return "[A] choose · [B] close · ←→ change system";
     }
     match app.tab {
-        Tab::Search => "[A] add to library · [B] actions · [X] search · [Y] menu · LB/RB tabs · LT/RT page",
+        Tab::Search => "[A] add / pick a source · [B] actions · [X] search · ←→ fold · [Y] menu · LB/RB tabs · LT/RT page",
         Tab::Library => "[A] download/open · [B] actions · [X] filter · [Y] menu · ←→ fold · LB/RB tabs · LT/RT page",
         Tab::Textures => "[A] install / turn on·off · [B] actions · [Y] menu · LB/RB tabs · LT/RT page",
+        Tab::Sources => "[A] open / actions · [B] actions · ←→ fold · [Y] menu · LB/RB tabs · LT/RT page",
     }
 }
 
@@ -139,38 +145,126 @@ fn draw_search(f: &mut Frame, app: &mut App, area: Rect) {
         &app.rom_query,
         app.editing,
     );
+    let games = app.search_rows.iter().filter(|r| matches!(r, SearchRow::Game(_))).count();
     let items: Vec<ListItem> = app
-        .rom_hits
+        .search_rows
         .iter()
-        .map(|h| {
-            let source = if h.live { h.source.clone() } else { h.source.chars().take(48).collect() };
-            let base = h.name.rsplit('/').next().unwrap_or(&h.name);
-            let on_disk = app.present.contains(&h.url) || app.on_disk.contains(&App::disk_key(&h.system, base));
-            let (mark, mark_style) = if on_disk {
-                ("● ", Style::new().fg(Color::Green))
-            } else if app.lib.contains(&h.url) {
-                ("✓ ", Style::new().fg(Color::Blue))
-            } else {
-                ("  ", Style::new())
-            };
-            let spans = vec![
-                Span::styled(mark, mark_style),
-                Span::raw(match &h.title {
-                    Some(t) => format!("{t}  [{base}]"),
-                    None => base.to_string(),
-                }),
-                Span::raw("  "),
-                Span::styled(if h.size > 0 { human(h.size) } else { "size ?".into() }, Style::new().fg(Color::Green)),
-                Span::raw("  "),
-                sys_span(&h.system),
-                Span::styled(format!("  {source}"), DIM),
-            ];
-            ListItem::new(Line::from(spans))
+        .map(|r| match r {
+            SearchRow::Header { system, count, collapsed } => {
+                let label = if system.is_empty() { "Unknown system (pick one with S)" } else { systems::label(system) };
+                let sys = if system.is_empty() { String::new() } else { format!("{system} · ") };
+                ListItem::new(Line::from(vec![
+                    Span::styled(format!("{} {label}", if *collapsed { "▸" } else { "▾" }), Style::new().fg(Color::Magenta).bold()),
+                    Span::styled(format!("  {sys}{count} game{}", if *count == 1 { "" } else { "s" }), DIM),
+                ]))
+            }
+            SearchRow::Game(hits) => {
+                let best = &app.rom_hits[hits[0]];
+                let base = best.name.rsplit('/').next().unwrap_or(&best.name);
+                let any = |f: &dyn Fn(&crate::app::RomHit) -> bool| hits.iter().any(|&i| f(&app.rom_hits[i]));
+                let on_disk = any(&|h| {
+                    app.present.contains(&h.url)
+                        || app.on_disk.contains(&App::disk_key(&h.system, h.name.rsplit('/').next().unwrap_or(&h.name)))
+                });
+                let (mark, mark_style) = if on_disk {
+                    ("● ", Style::new().fg(Color::Green))
+                } else if any(&|h| app.lib.contains(&h.url)) {
+                    ("✓ ", Style::new().fg(Color::Blue))
+                } else {
+                    ("  ", Style::new())
+                };
+                let bolt = if app.instant(best) { Span::styled("⚡", Style::new().fg(Color::Yellow)) } else { Span::raw("  ") };
+                let source = if hits.len() > 1 {
+                    Span::styled(format!("  {} sources", hits.len()), Style::new().fg(Color::Cyan))
+                } else {
+                    Span::styled(format!("  {}", best.source.chars().take(48).collect::<String>()), DIM)
+                };
+                let mut spans = vec![
+                    Span::raw("  "),
+                    Span::styled(mark, mark_style),
+                    bolt,
+                    Span::raw(" "),
+                    Span::raw(match &best.title {
+                        Some(t) => format!("{t}  [{base}]"),
+                        None => crate::names::parse(&best.system, &best.name).display(),
+                    }),
+                    Span::raw("  "),
+                    Span::styled(if best.size > 0 { human(best.size) } else { "size ?".into() }, Style::new().fg(Color::Green)),
+                    source,
+                ];
+                if best.system.is_empty() {
+                    spans.push(Span::raw("  "));
+                    spans.push(sys_span(&best.system));
+                }
+                ListItem::new(Line::from(spans))
+            }
         })
         .collect();
     let live = if app.live_loading { " · searching archive.org…" } else { "" };
-    let title = format!(" Results ({}){live} · ✓ in library · ● on disk ", app.rom_hits.len());
+    let title = format!(" Results ({games}){live} · ⚡ cached on TorBox · ✓ in library · ● on disk · Enter: add / pick a source ");
     f.render_stateful_widget(List::new(items).block(border(title, !app.editing)).highlight_style(HL), list, &mut app.rom_state);
+}
+
+fn ago(secs: u64) -> String {
+    match secs {
+        s if s < 3600 => format!("{}m ago", s / 60),
+        s if s < 86_400 => format!("{}h ago", s / 3600),
+        s => format!("{}d ago", s / 86_400),
+    }
+}
+
+fn draw_sources(f: &mut Frame, app: &mut App, area: Rect) {
+    let rows = app.set_rows();
+    if app.sets_cursor.is_none() {
+        app.sets_cursor = rows.first().map(App::set_row_key);
+    }
+    let selected = app.sets_cursor.as_ref().and_then(|c| rows.iter().position(|r| App::set_row_key(r) == *c));
+    let items: Vec<ListItem> = rows
+        .iter()
+        .map(|r| match r {
+            SetRow::Group { name, sets, files, collapsed } => ListItem::new(Line::from(vec![
+                Span::styled(format!("{} {name}", if *collapsed { "▸" } else { "▾" }), Style::new().fg(Color::Magenta).bold()),
+                Span::styled(format!("  {sets} set{} · {files} files", if *sets == 1 { "" } else { "s" }), DIM),
+            ])),
+            SetRow::Set(item) => {
+                let sys = app.sets.iter().find(|s| &s.item == item).map(|s| s.system.clone()).unwrap_or_default();
+                let info = app.set_info(item, &sys);
+                let (badge, color, detail) = match &info.state {
+                    SetState::Indexed if info.cached => ("⚡ cached", Color::Yellow, String::new()),
+                    SetState::Indexed => ("● indexed", Color::Green, String::new()),
+                    SetState::Indexing => ("… indexing", Color::Cyan, String::new()),
+                    SetState::Waiting => ("○ waiting", Color::DarkGray, String::new()),
+                    SetState::Failed(e) => ("✗ failed", Color::Red, e.chars().take(80).collect()),
+                    SetState::Locked => ("🔒 login", Color::DarkGray, "restricted: romgetter archive-login unlocks it".into()),
+                };
+                let mut spans = vec![
+                    Span::raw("  "),
+                    Span::styled(format!("{badge:<11}"), Style::new().fg(color).bold()),
+                    Span::raw(info.title.clone()),
+                    Span::raw("  "),
+                    if info.system.is_empty() {
+                        Span::styled("→ several systems", Style::new().fg(Color::Magenta))
+                    } else {
+                        sys_span(&info.system)
+                    },
+                ];
+                if info.files > 0 {
+                    spans.push(Span::styled(format!("  {} games", info.files), DIM));
+                    spans.push(Span::styled(format!("  {}", human(info.size)), Style::new().fg(Color::Green)));
+                }
+                if let Some(a) = info.age.filter(|_| matches!(info.state, SetState::Indexed)) {
+                    spans.push(Span::styled(format!("  indexed {}", ago(a)), DIM));
+                }
+                if !detail.is_empty() {
+                    spans.push(Span::styled(format!("  {detail}"), Style::new().fg(Color::Red)));
+                }
+                ListItem::new(Line::from(spans))
+            }
+        })
+        .collect();
+    app.sets_state.select(selected);
+    let title = format!(" Sources · {} sets · {} games searchable ", app.sets.len(), app.total_files());
+    f.render_stateful_widget(List::new(items).block(border(title, true)).highlight_style(HL), area, &mut app.sets_state);
 }
 
 /// (badge, color, detail) for a library game.
@@ -231,7 +325,11 @@ fn game_status(app: &App, id: &str) -> (String, Color, String) {
             if app.lib.get(id).is_some_and(|g| crate::ifarchive::is_url(&g.source)) {
                 ("○ free".into(), Color::DarkGray, "IF Archive · Enter downloads it".into())
             } else {
-                ("○ direct".into(), Color::DarkGray, "restricted on archive.org (TorBox can't fetch it) · Enter downloads it with your login".into())
+                (
+                    "○ direct".into(),
+                    Color::DarkGray,
+                    "restricted on archive.org (TorBox can't fetch it) · Enter downloads it with your login".into(),
+                )
             }
         }
         Some(Remote::NotSent) | None => ("○ not sent".into(), Color::DarkGray, "Enter sends to TorBox".into()),

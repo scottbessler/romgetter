@@ -8,6 +8,7 @@ mod library;
 mod mame;
 mod metacritic;
 mod minerva;
+mod names;
 mod ps3;
 mod realdebrid;
 mod remotezip;
@@ -57,9 +58,8 @@ async fn main() -> Result<()> {
         _ => {}
     }
 
-    let mut builder = reqwest::Client::builder()
-        .user_agent(concat!("romgetter/", env!("CARGO_PKG_VERSION")))
-        .connect_timeout(Duration::from_secs(20));
+    let mut builder =
+        reqwest::Client::builder().user_agent(concat!("romgetter/", env!("CARGO_PKG_VERSION"))).connect_timeout(Duration::from_secs(20));
     if let Some(login) = &cfg.archive_login {
         builder = builder.cookie_provider(archive::cookie_jar(login));
     }
@@ -206,13 +206,35 @@ async fn main() -> Result<()> {
                 app.on_msg(m);
             }
         }
-        for h in app.rom_hits.iter().take(25) {
-            let base = h.name.rsplit('/').next().unwrap_or(&h.name);
-            let mark = if app.on_disk.contains(&App::disk_key(&h.system, base)) { "●" } else { " " };
-            let base = h.title.as_ref().map(|t| format!("{t}  [{base}]")).unwrap_or_else(|| base.to_string());
-            println!("{mark} {:<12} {:>10}  {base}  [{}]", h.system, ui::human(h.size), h.source);
+        let mut shown = 0;
+        for row in &app.search_rows {
+            match row {
+                app::SearchRow::Header { system, count, .. } => println!("▾ {} ({count})", if system.is_empty() { "?" } else { system }),
+                app::SearchRow::Game(hits) if shown < 40 => {
+                    shown += 1;
+                    for (n, &i) in hits.iter().enumerate() {
+                        let h = &app.rom_hits[i];
+                        let base = h.name.rsplit('/').next().unwrap_or(&h.name);
+                        let mark = if app.on_disk.contains(&App::disk_key(&h.system, base)) { "●" } else { " " };
+                        let bolt = if app.instant(h) { "⚡" } else { "  " };
+                        if n == 0 {
+                            println!(
+                                "  {mark} {}  ({} source{})",
+                                names::parse(&h.system, &h.name).display(),
+                                hits.len(),
+                                if hits.len() == 1 { "" } else { "s" }
+                            );
+                        }
+                        let lead = format!("    └{bolt}");
+                        let base = h.title.as_ref().map(|t| format!("{t}  [{base}]")).unwrap_or_else(|| base.to_string());
+                        println!("  {lead} {:>10}  {base}  [{}]", ui::human(h.size), h.source);
+                    }
+                }
+                app::SearchRow::Game(_) => {}
+            }
         }
-        println!("({} results)", app.rom_hits.len());
+        let games = app.search_rows.iter().filter(|r| matches!(r, app::SearchRow::Game(_))).count();
+        println!("({games} games, {} files)", app.rom_hits.len());
         return Ok(());
     }
 

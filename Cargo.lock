@@ -2078,6 +2078,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "directories",
+ "flate2",
  "futures-util",
  "ratatui",
  "reqwest",

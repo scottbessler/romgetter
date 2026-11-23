@@ -29,6 +29,9 @@ pub struct RomFile {
     /// A readable title when the file name isn't one (IF Archive: "Photopia, by Adam Cadre").
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,
+    /// This file's system when the set holds several ("REDUMP/Sony - PlayStation/…").
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub system: Option<String>,
 }
 
 impl RomFile {
@@ -66,6 +69,7 @@ fn parse_archive_listing(html: &str, item: &str, archive: &str) -> Vec<RomFile> 
             url: Some(format!("https:{href}")),
             torrent_index: None,
             title: None,
+            system: None,
         });
     }
     out
@@ -253,6 +257,7 @@ async fn fetch_index_opts(http: &reqwest::Client, item: &str, deep: bool) -> Res
             url: None,
             torrent_index: None,
             title: None,
+            system: None,
         })
         .collect();
     let may_expand = deep && roms.len() <= EXPAND_ONLY_IF_FILES_AT_MOST;
@@ -387,7 +392,10 @@ mod tests {
 
     #[test]
     fn items_of_urls() {
-        assert_eq!(item_of_url("https://archive.org/download/microsoft_xbox360_a_part1/ABC%20Wipeout%202%20(USA).zip"), Some("microsoft_xbox360_a_part1"));
+        assert_eq!(
+            item_of_url("https://archive.org/download/microsoft_xbox360_a_part1/ABC%20Wipeout%202%20(USA).zip"),
+            Some("microsoft_xbox360_a_part1")
+        );
         assert_eq!(item_of_url(&download_url("x", "a/b.zip")), Some("x"));
         assert_eq!(item_of_url("https://ifarchive.org/if-archive/games/zcode/x.z5"), None);
         assert_eq!(item_of_url("minerva:abc/x.zip"), None);

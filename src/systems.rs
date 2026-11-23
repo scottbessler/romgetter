@@ -72,6 +72,7 @@ pub const SYSTEMS: &[(&str, &str)] = &[
     ("x68000", "Sharp - X68000"),
     ("c64", "Commodore - 64"),
     ("amiga", "Commodore - Amiga"),
+    ("dos", "PC - MS-DOS"),
     ("zmachine", "Interactive Fiction - Z-machine"),
     ("if", "Interactive Fiction"),
     ("mame", "Arcade - MAME"),
@@ -198,6 +199,12 @@ const TITLE_PATTERNS: &[(&str, &str)] = &[
     ("commodore 64", "c64"),
     ("c64", "c64"),
     ("amiga", "amiga"),
+    ("exodos", "dos"),
+    ("ms dos", "dos"),
+    ("msdos", "dos"),
+    ("total dos", "dos"),
+    ("dos collection", "dos"),
+    ("dos games", "dos"),
     ("z machine", "zmachine"),
     ("zmachine", "zmachine"),
     ("zcode", "zmachine"),
@@ -212,7 +219,7 @@ const TITLE_PATTERNS: &[(&str, &str)] = &[
 
 /// Short squashed patterns that are still safe to match as raw substrings
 /// (e.g. inside "SonyPSXISORedumpSet"). Anything 6+ chars is considered safe.
-const SAFE_SHORT: &[&str] = &["psx", "snes", "n64", "gba", "gbc", "3ds", "ps2", "ps3", "psp", "wiiu", "nesfiles"];
+const SAFE_SHORT: &[&str] = &["psx", "snes", "n64", "gba", "gbc", "3ds", "ps2", "ps3", "psp", "wiiu", "nesfiles", "msdos"];
 
 /// Extensions that identify a system on their own. Ambiguous ones
 /// (.bin .iso .chd .cue .zip .7z .rvz ...) are deliberately left out.
@@ -606,6 +613,11 @@ mod tests {
             ("ef_Nintendo_Gameboy_No-Intro_2024-04-23", Some("gb")),
             ("PS3_NOINTRO_USA_8", Some("ps3")),
             ("NintendoGameCubeRedump", Some("gc")),
+            ("eXoDOSRPG", Some("dos")),
+            ("eXoDOS", Some("dos")),
+            ("[CDDL] [Антология] Total DOS Collection #24 (Blood, Carmageddon, Doom)", Some("dos")),
+            ("MS-DOS Games", Some("dos")),
+            ("Dos Hermanos (2010)", None),
             ("Super Monkey Ball (GCN)", Some("gc")),
             ("Super Monkey Ball Banana Mania (PlayStation 5)", None),
             ("Super Monkey Ball Banana Mania (Xbox Series X)", None),

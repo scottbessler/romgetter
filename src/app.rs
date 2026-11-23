@@ -41,17 +41,65 @@ pub enum Tab {
     Search,
     Library,
     Textures,
+    Sources,
 }
 
 impl Tab {
-    pub const ALL: [Tab; 3] = [Tab::Search, Tab::Library, Tab::Textures];
+    pub const ALL: [Tab; 4] = [Tab::Search, Tab::Library, Tab::Textures, Tab::Sources];
     pub fn title(self) -> &'static str {
         match self {
             Tab::Search => "1 Search",
             Tab::Library => "2 Library",
             Tab::Textures => "3 Textures",
+            Tab::Sources => "4 Sources",
         }
     }
+}
+
+/// Where search sets come from, in the Sources tab's order.
+pub const SET_GROUPS: &[&str] = &[
+    "Minerva · No-Intro",
+    "Minerva · Redump",
+    "Your TorBox torrents",
+    "archive.org · built-in sets",
+    "archive.org · restricted (romgetter archive-login)",
+    "archive.org · your extra sets",
+    "IF Archive",
+];
+
+/// A row of the Sources tab.
+pub enum SetRow {
+    Group {
+        name: &'static str,
+        sets: usize,
+        files: usize,
+        collapsed: bool,
+    },
+    /// A search set (its `SetRef::item`).
+    Set(String),
+}
+
+/// What the Sources tab shows for one set.
+pub enum SetState {
+    Indexed,
+    Indexing,
+    /// Not indexed yet (waiting for a slot, or nothing tried).
+    Waiting,
+    Failed(String),
+    /// Restricted on archive.org and not logged in: hidden from search.
+    Locked,
+}
+
+pub struct SetInfo {
+    pub title: String,
+    pub system: String,
+    pub files: usize,
+    pub size: u64,
+    pub state: SetState,
+    /// Cached on TorBox (a torrent in the account): games come straight away.
+    pub cached: bool,
+    /// Indexed this many seconds ago.
+    pub age: Option<u64>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -89,6 +137,7 @@ pub enum Remote {
 }
 
 /// A set Search indexes: built-in or from `extra_sets` in the config.
+#[derive(Clone)]
 pub struct SetRef {
     pub item: String,
     /// empty = detect
@@ -108,6 +157,20 @@ pub struct RomHit {
     pub torrent: Option<(String, Option<u32>)>,
     /// Full title for MAME short-name zips.
     pub title: Option<String>,
+}
+
+/// What each torrent in the TorBox account holds (see `tbzips::held`).
+pub type TorboxHeld = HashMap<String, Option<HashSet<String>>>;
+
+/// A row of search results: a system header, or one game with every source found for it.
+pub enum SearchRow {
+    Header {
+        system: String,
+        count: usize,
+        collapsed: bool,
+    },
+    /// Indices into `rom_hits`, best source first.
+    Game(Vec<usize>),
 }
 
 /// One set's files prepared for instant search (built once, not per keystroke).
@@ -142,6 +205,10 @@ pub struct Menu {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Act {
     AddRom,
+    /// Search: add the game from this hit (index into `rom_hits`).
+    AddSource(usize),
+    /// Search: list the selected game's sources.
+    Sources,
     Download,
     DownloadDirect,
     /// "System: x ◂ ▸", changed in place with ←/→ (or Enter).
@@ -168,6 +235,9 @@ pub enum Act {
     TexRemove,
     TexPage,
     TexRefresh,
+    /// Sources tab: search the selected set's system / index it again.
+    SetSearch,
+    Reindex,
     Quit,
     Close,
 }
@@ -195,7 +265,7 @@ pub enum Msg {
     Indexed(String, anyhow::Result<ItemIndex>),
     MinervaFolders(String, anyhow::Result<Vec<minerva::Folder>>),
     /// Zipped ROM-set torrents found in the TorBox account.
-    TorboxZips(anyhow::Result<Vec<tbzips::Candidate>>),
+    TorboxZips(anyhow::Result<(Vec<tbzips::Candidate>, TorboxHeld)>),
     /// TorBox's cached files per Minerva torrent (hashes asked about, result).
     MinervaCache(Vec<String>, anyhow::Result<HashMap<String, HashSet<String>>>),
     /// A game was put on Real-Debrid (game id, RD torrent id).
@@ -255,6 +325,12 @@ fn save_folders(cache_dir: &Path, group: &str, folders: &[minerva::Folder]) {
     if let Ok(json) = serde_json::to_vec(&c) {
         let _ = std::fs::write(folders_path(cache_dir, group), json);
     }
+}
+
+/// A set file's system: its own (sets of several systems), its extension or folders,
+/// then the set's.
+fn file_system<'a>(f: &'a archive::RomFile, set_system: &'a str) -> &'a str {
+    f.system.as_deref().or_else(|| systems::guess_for_file(&f.name)).unwrap_or(set_system)
 }
 
 fn tb_zips_path(cache_dir: &Path) -> PathBuf {
@@ -395,6 +471,8 @@ pub struct App {
     /// Zipped ROM-set torrents in the TorBox account, by info-hash.
     tb_zips: HashMap<String, tbzips::Candidate>,
     tb_zips_pending: bool,
+    /// Torrents in the TorBox account and what of each is there (for ⚡ in search).
+    tb_held: TorboxHeld,
     /// btih → what TorBox has cached of that Minerva torrent (absent = not checked yet).
     pub minerva_cache: HashMap<String, TorrentCache>,
     cache_checked: u64,
@@ -418,7 +496,14 @@ pub struct App {
     /// Downloads already being (or done being) imported.
     dl_claimed: HashSet<PathBuf>,
     last_dl_scan: Option<Instant>,
+    /// Every hit (one per URL); `search_rows` groups them.
     pub rom_hits: Vec<RomHit>,
+    pub search_rows: Vec<SearchRow>,
+    /// Each search row's key (system header or game), for keeping the selection.
+    search_keys: Vec<String>,
+    /// Systems folded in the search results.
+    search_collapsed: HashSet<String>,
+    /// Selected row of `search_rows`.
     pub rom_state: ListState,
     live_gen: u64,
     live_due: Option<Instant>,
@@ -469,6 +554,12 @@ pub struct App {
     pad_typing: bool,
     pub menu: Option<Menu>,
     pub tex: TexTab,
+    /// Sources tab: cursor (a group name or set item) and the groups opened.
+    pub sets_cursor: Option<String>,
+    pub sets_state: ListState,
+    sets_open: HashSet<String>,
+    /// Why a set's last indexing failed.
+    index_errors: HashMap<String, String>,
     /// Where `cfg` came from, for saving settings changed in the app (None in tests).
     pub config_file: Option<PathBuf>,
     tx: UnboundedSender<Msg>,
@@ -516,7 +607,7 @@ impl App {
             }
         }
         let mut app = Self {
-            tab: if lib.games.is_empty() { Tab::Search } else { Tab::Library },
+            tab: Tab::Search,
             editing: lib.games.is_empty(),
             cfg,
             cache_dir,
@@ -526,6 +617,7 @@ impl App {
             index_permits: Arc::new(Semaphore::new(4)),
             minerva_pending: 0,
             tb_zips_pending: false,
+            tb_held: HashMap::new(),
             tb_zips: tb_zips.into_iter().map(|c| (c.hash.clone(), c)).collect(),
             minerva_cache: HashMap::new(),
             cache_checked: 0,
@@ -543,6 +635,9 @@ impl App {
             dl_claimed: HashSet::new(),
             last_dl_scan: None,
             rom_hits: Vec::new(),
+            search_rows: Vec::new(),
+            search_keys: Vec::new(),
+            search_collapsed: HashSet::new(),
             rom_state: ListState::default(),
             live_gen: 0,
             live_due: None,
@@ -577,6 +672,10 @@ impl App {
             pad_typing: false,
             menu: None,
             tex,
+            sets_cursor: None,
+            sets_state: ListState::default(),
+            sets_open: HashSet::new(),
+            index_errors: HashMap::new(),
             config_file: None,
             tx,
             local_tx,
@@ -951,7 +1050,7 @@ impl App {
             }
             let set_system = if s.system.is_empty() { idx.system.clone().unwrap_or_default() } else { s.system.clone() };
             for f in &idx.files {
-                if systems::guess_for_file(&f.name).unwrap_or(set_system.as_str()) != system {
+                if file_system(f, &set_system) != system {
                     continue;
                 }
                 let n = crate::metacritic::norm(&f.name);
@@ -1247,7 +1346,7 @@ impl App {
         let tx = self.tx.clone();
         self.tb_zips_pending = true;
         tokio::spawn(async move {
-            let res = tb.list(Kind::Torrent).await.map(|items| tbzips::candidates(&items));
+            let res = tb.list(Kind::Torrent).await.map(|items| (tbzips::candidates(&items), tbzips::held(&items)));
             let _ = tx.send(Msg::TorboxZips(res));
         });
     }
@@ -1372,6 +1471,7 @@ impl App {
                 self.indexing.remove(&item);
                 match res {
                     Ok(idx) => {
+                        self.index_errors.remove(&item);
                         let _ = archive::save_cached(&self.cache_dir, &item, &idx);
                         self.hay.remove(&item);
                         self.index.insert(item, idx);
@@ -1382,7 +1482,10 @@ impl App {
                         self.refresh_local();
                     }
                     // Keep any cached copy; just report.
-                    Err(e) => self.status = format!("indexing {item} failed: {e:#}"),
+                    Err(e) => {
+                        self.status = format!("indexing {item} failed: {e:#}");
+                        self.index_errors.insert(item, format!("{e:#}"));
+                    }
                 }
             }
             Msg::TopGames(system, res) => match res {
@@ -1522,7 +1625,8 @@ impl App {
                 }
             }
             Msg::TorboxZips(res) => match res {
-                Ok(cands) => {
+                Ok((cands, held)) => {
+                    self.tb_held = held;
                     if let Ok(json) = serde_json::to_vec(&cands) {
                         let _ = std::fs::create_dir_all(&self.cache_dir);
                         let _ = std::fs::write(tb_zips_path(&self.cache_dir), json);
@@ -1531,7 +1635,8 @@ impl App {
                     let keep: HashSet<String> = cands.iter().map(tbzips::Candidate::key).collect();
                     self.sets.retain(|s| tbzips::parse_key(&s.item).is_none() || keep.contains(&s.item));
                     self.tb_zips = cands.iter().map(|c| (c.hash.clone(), c.clone())).collect();
-                    let new: Vec<SetRef> = tb_zip_sets(&cands).into_iter().filter(|s| !self.sets.iter().any(|x| x.item == s.item)).collect();
+                    let new: Vec<SetRef> =
+                        tb_zip_sets(&cands).into_iter().filter(|s| !self.sets.iter().any(|x| x.item == s.item)).collect();
                     let pos = tb_zip_pos(&self.sets);
                     self.sets.splice(pos..pos, new);
                     let to_index: Vec<String> = cands
@@ -1545,7 +1650,7 @@ impl App {
                 }
                 Err(e) => self.status = format!("listing TorBox torrents failed: {e:#}"),
             },
-                        Msg::MinervaFolders(group, res) => {
+            Msg::MinervaFolders(group, res) => {
                 self.minerva_pending = self.minerva_pending.saturating_sub(1);
                 match res {
                     Ok(folders) => {
@@ -1638,6 +1743,11 @@ impl App {
             },
             Msg::Remote(kind, res) => {
                 self.polls_in_flight = self.polls_in_flight.saturating_sub(1);
+                if let (Kind::Torrent, Ok(items)) = (kind, &res)
+                    && !items.is_empty()
+                {
+                    self.tb_held = tbzips::held(items);
+                }
                 match res {
                     // An empty list while games are waiting is almost always a TorBox hiccup;
                     // marking everything "gone" would make every game re-send.
@@ -1768,7 +1878,7 @@ impl App {
             .iter()
             .map(|f| {
                 // File's own extension / folders first, then the set's system.
-                let system = systems::guess_for_file(&f.name).unwrap_or(set_system);
+                let system = systems::folder_static(file_system(f, set_system));
                 let title = if crate::mame::is_mame_system(system) {
                     crate::mame::short_name(&f.name).and_then(|n| self.mame_titles.get(&n).cloned())
                 } else {
@@ -1879,31 +1989,166 @@ impl App {
         out
     }
 
+    /// TorBox has this file cached right now, so it downloads straight away (⚡): a
+    /// torrent in the TorBox account, or a Minerva file TorBox says it has.
+    pub fn instant(&self, h: &RomHit) -> bool {
+        let Some((btih, _)) = &h.torrent else { return false };
+        let btih = btih.to_lowercase();
+        if self.broken_torbox.contains_key(&btih) {
+            return false;
+        }
+        if self.tb_zips.contains_key(&btih) {
+            return true;
+        }
+        let base = h.name.rsplit('/').next().unwrap_or(&h.name).to_lowercase();
+        match self.tb_held.get(&btih) {
+            Some(None) => return true,
+            Some(Some(files)) if files.contains(&base) => return true,
+            _ => {}
+        }
+        matches!(self.minerva_cache.get(&btih), Some(TorrentCache { files: Some(f) }) if f.contains(&base))
+    }
+
+    /// Lower is a better source: cached on TorBox, then indexed sets, live archive.org, Vimm.
+    fn source_rank(&self, h: &RomHit) -> u8 {
+        if self.instant(h) {
+            0
+        } else if vimm::is_vimm_url(&h.url) {
+            3
+        } else if h.live {
+            2
+        } else {
+            1
+        }
+    }
+
+    /// The key of a search row, for keeping the selection across refreshes.
     fn merge_hits(&mut self) {
-        let keep = self.rom_state.selected().and_then(|i| self.rom_hits.get(i)).map(|h| h.url.clone());
-        // Same game from several sets (e.g. three PS1 Redump uploads) shows once; built-in
-        // sets come first, so they win over live uploads.
+        let keep = self.rom_state.selected().and_then(|i| self.search_keys.get(i)).cloned();
         let mut seen = HashSet::new();
-        let mut merged: Vec<RomHit> = self
+        let hits: Vec<RomHit> = self
             .local_hits
             .iter()
             .chain(self.live_hits.iter())
             .chain(self.vimm_hits.iter())
-            .filter(|h| {
-                let base = h.name.rsplit('/').next().unwrap_or(&h.name).to_lowercase();
-                seen.insert(h.url.clone()) && seen.insert(format!("{}\0{base}", h.system))
-            })
+            .filter(|h| seen.insert(h.url.clone()))
             .cloned()
             .collect();
+        // Same game from several sources shows once, best source first.
+        let parsed: Vec<crate::names::GameName> = hits.iter().map(|h| crate::names::parse(&h.system, &h.name)).collect();
+        let mut groups: HashMap<String, Vec<usize>> = HashMap::new();
+        for (i, h) in hits.iter().enumerate() {
+            groups.entry(parsed[i].key(&h.system)).or_default().push(i);
+        }
+        let base = |h: &RomHit| h.name.rsplit('/').next().unwrap_or(&h.name).to_string();
+        let mut games: Vec<(String, Vec<usize>)> = groups.into_iter().collect();
+        for (_, g) in &mut games {
+            // cached on TorBox first, then the best version (finished game, USA, latest rev),
+            // then the best source of it
+            g.sort_by_cached_key(|&i| {
+                let rank = self.source_rank(&hits[i]);
+                (rank != 0, crate::names::preference(&hits[i].name), rank, base(&hits[i]).len())
+            });
+        }
         // Grouped by system (Library order, undetected last), then alphabetical by name.
         let order = |s: &str| systems::SYSTEMS.iter().position(|(f, _)| *f == s).unwrap_or(usize::MAX);
-        merged.sort_by_cached_key(|h| {
-            let name = h.title.as_deref().unwrap_or_else(|| h.name.rsplit('/').next().unwrap_or(&h.name));
-            (order(&h.system), name.to_lowercase(), h.live)
+        games.sort_by_cached_key(|(_, g)| {
+            let h = &hits[g[0]];
+            let name = h.title.clone().unwrap_or_else(|| parsed[g[0]].display());
+            (order(&h.system), h.system.clone(), name.to_lowercase())
         });
-        self.rom_hits = merged;
-        let sel = keep.and_then(|u| self.rom_hits.iter().position(|h| h.url == u));
-        self.rom_state.select(sel.or(if self.rom_hits.is_empty() { None } else { Some(0) }));
+        let (mut rows, mut keys) = (Vec::new(), Vec::new());
+        let mut i = 0;
+        while i < games.len() {
+            let system = hits[games[i].1[0]].system.clone();
+            let n = games[i..].iter().take_while(|(_, g)| hits[g[0]].system == system).count();
+            let collapsed = self.search_collapsed.contains(&system);
+            keys.push(format!("\u{1}{system}"));
+            rows.push(SearchRow::Header { system, count: n, collapsed });
+            if !collapsed {
+                for (k, g) in &games[i..i + n] {
+                    keys.push(k.clone());
+                    rows.push(SearchRow::Game(g.clone()));
+                }
+            }
+            i += n;
+        }
+        self.rom_hits = hits;
+        self.search_rows = rows;
+        self.search_keys = keys;
+        let sel = keep.and_then(|k| self.search_keys.iter().position(|x| *x == k));
+        // start on the first game, not its header
+        let first =
+            self.search_rows.iter().position(|r| matches!(r, SearchRow::Game(_))).or_else(|| (!self.search_rows.is_empty()).then_some(0));
+        self.rom_state.select(sel.or(first));
+    }
+
+    /// The selected search row's hits, best first (None on a header).
+    pub fn selected_hits(&self) -> Option<&[usize]> {
+        match self.rom_state.selected().and_then(|i| self.search_rows.get(i))? {
+            SearchRow::Game(hits) => Some(hits),
+            SearchRow::Header { .. } => None,
+        }
+    }
+
+    fn selected_hit(&self) -> Option<&RomHit> {
+        self.selected_hits().and_then(|h| self.rom_hits.get(h[0]))
+    }
+
+    /// The system of the selected search row (a header's own, or its game's).
+    fn search_cursor_system(&self) -> Option<String> {
+        match self.rom_state.selected().and_then(|i| self.search_rows.get(i))? {
+            SearchRow::Header { system, .. } => Some(system.clone()),
+            SearchRow::Game(hits) => self.rom_hits.get(hits[0]).map(|h| h.system.clone()),
+        }
+    }
+
+    fn set_search_collapsed(&mut self, system: &str, collapsed: bool) {
+        if collapsed {
+            self.search_collapsed.insert(system.to_string());
+        } else {
+            self.search_collapsed.remove(system);
+        }
+        self.merge_hits();
+        // keep the cursor on the folded group's header
+        if collapsed && let Some(i) = self.search_rows.iter().position(|r| matches!(r, SearchRow::Header { system: s, .. } if s == system))
+        {
+            self.rom_state.select(Some(i));
+        }
+    }
+
+    /// Enter in search results: fold a header; add a game, or pick among its sources.
+    fn activate_search_row(&mut self) {
+        if let Some(sys) = self.rom_state.selected().and_then(|i| self.search_rows.get(i)).and_then(|r| match r {
+            SearchRow::Header { system, collapsed, .. } => Some((system.clone(), *collapsed)),
+            SearchRow::Game(_) => None,
+        }) {
+            return self.set_search_collapsed(&sys.0, !sys.1);
+        }
+        let Some(hits) = self.selected_hits() else { return };
+        if hits.len() > 1 && !hits.iter().any(|&i| self.lib.contains(&self.rom_hits[i].url)) {
+            return self.open_source_menu();
+        }
+        self.add_selected_rom();
+    }
+
+    /// The selected game's sources to choose from, best first.
+    fn open_source_menu(&mut self) {
+        let Some(hits) = self.selected_hits() else { return };
+        let items = hits
+            .iter()
+            .map(|&i| {
+                let h = &self.rom_hits[i];
+                let bolt = if self.instant(h) { "⚡ " } else { "   " };
+                let size = if h.size > 0 { crate::ui::human(h.size) } else { "size ?".into() };
+                let base = h.name.rsplit('/').next().unwrap_or(&h.name);
+                let source: String = h.source.chars().take(48).collect();
+                (format!("{bolt}{size:>9}  {base}  · {source}"), Act::AddSource(i))
+            })
+            .collect();
+        let h = &self.rom_hits[hits[0]];
+        let name = h.title.clone().unwrap_or_else(|| h.name.rsplit('/').next().unwrap_or(&h.name).to_string());
+        self.menu = Some(Menu { title: format!("{name} · pick a source"), items, sel: 0 });
     }
 
     /// Run a search immediately (local + live), for the headless `search` command.
@@ -1929,14 +2174,25 @@ impl App {
         self.live_due = (self.rom_query.trim().len() >= 3).then(|| Instant::now() + LIVE_DEBOUNCE);
     }
 
+    /// Add the selected game from its best source.
     fn add_selected_rom(&mut self) {
-        let Some(hit) = self.rom_state.selected().and_then(|i| self.rom_hits.get(i)) else { return };
+        let Some(hits) = self.selected_hits() else { return };
+        if hits.iter().any(|&i| self.lib.contains(&self.rom_hits[i].url)) {
+            self.status = "already in your library".into();
+            return;
+        }
+        self.add_hit(hits[0]);
+    }
+
+    /// Add one search hit (one source of a game) to the library.
+    fn add_hit(&mut self, i: usize) {
+        let Some(hit) = self.rom_hits.get(i) else { return };
         if self.lib.contains(&hit.url) {
             self.status = "already in your library".into();
             return;
         }
         if hit.system.is_empty() {
-            self.status = "couldn't detect the system for this file; pick one with s/S first".into();
+            self.status = "couldn't detect the system for this file; pick one with S first".into();
             return;
         }
         if self.on_disk.contains(&Self::disk_key(&hit.system, hit.name.rsplit('/').next().unwrap_or(&hit.name))) {
@@ -1983,6 +2239,163 @@ impl App {
         }
         self.lib_cursor = Some(RowKey::Game(id.clone()));
         self.send_to_torbox(&id);
+    }
+
+    // ---------- sources ----------
+
+    /// Which group of the Sources tab a set belongs to.
+    fn set_group(&self, item: &str) -> &'static str {
+        if let Some((group, _)) = minerva::parse_key(item) {
+            return if group == "Redump" { SET_GROUPS[1] } else { SET_GROUPS[0] };
+        }
+        if tbzips::parse_key(item).is_some() {
+            return SET_GROUPS[2];
+        }
+        if item == ifarchive::KEY {
+            return SET_GROUPS[6];
+        }
+        if self.cfg.extra_sets.iter().any(|c| c.item == item) {
+            return SET_GROUPS[5];
+        }
+        if self.index.get(item).is_some_and(|i| i.restricted) { SET_GROUPS[4] } else { SET_GROUPS[3] }
+    }
+
+    pub fn set_info(&self, item: &str, system: &str) -> SetInfo {
+        let idx = self.index.get(item);
+        let title = match (idx.map(|i| i.title.as_str()).filter(|t| !t.is_empty()), minerva::parse_key(item)) {
+            (_, Some((_, folder))) => folder.to_string(),
+            (Some(t), None) => t.to_string(),
+            (None, None) => item.to_string(),
+        };
+        let state = if idx.is_some_and(|i| self.hidden(i)) {
+            SetState::Locked
+        } else if self.indexing.contains(item) {
+            SetState::Indexing
+        } else if idx.is_some() {
+            SetState::Indexed
+        } else if let Some(e) = self.index_errors.get(item) {
+            SetState::Failed(e.clone())
+        } else {
+            SetState::Waiting
+        };
+        let cached = tbzips::parse_key(item).is_some()
+            || idx.and_then(|i| i.btih.as_deref()).is_some_and(|h| matches!(self.tb_held.get(&h.to_lowercase()), Some(None)));
+        let system = if system.is_empty() { idx.and_then(|i| i.system.clone()).unwrap_or_default() } else { system.to_string() };
+        SetInfo {
+            title,
+            system,
+            files: idx.map_or(0, |i| i.files.len()),
+            size: idx.map_or(0, |i| i.files.iter().map(|f| f.size).sum()),
+            state,
+            cached,
+            age: idx.filter(|i| i.fetched > 0).map(|i| i.age().as_secs()),
+        }
+    }
+
+    /// Group headers, and each open group's sets (by system, then title).
+    pub fn set_rows(&self) -> Vec<SetRow> {
+        let order = |s: &str| systems::SYSTEMS.iter().position(|(f, _)| *f == s).unwrap_or(usize::MAX);
+        let mut rows = Vec::new();
+        for name in SET_GROUPS {
+            let mut sets: Vec<(&SetRef, String)> = self
+                .sets
+                .iter()
+                .filter(|s| self.set_group(&s.item) == *name)
+                .map(|s| (s, self.set_info(&s.item, &s.system).title.to_lowercase()))
+                .collect();
+            if sets.is_empty() {
+                continue;
+            }
+            sets.sort_by(|a, b| (order(&a.0.system), &a.1).cmp(&(order(&b.0.system), &b.1)));
+            let files = sets.iter().filter_map(|(s, _)| self.index.get(&s.item)).map(|i| i.files.len()).sum();
+            let open = self.sets_open.contains(*name);
+            rows.push(SetRow::Group { name, sets: sets.len(), files, collapsed: !open });
+            if open {
+                rows.extend(sets.into_iter().map(|(s, _)| SetRow::Set(s.item.clone())));
+            }
+        }
+        rows
+    }
+
+    pub fn set_row_key(row: &SetRow) -> String {
+        match row {
+            SetRow::Group { name, .. } => format!("\u{1}{name}"),
+            SetRow::Set(item) => item.clone(),
+        }
+    }
+
+    /// The SetRef under the Sources cursor (None on a group header).
+    fn selected_set(&self) -> Option<SetRef> {
+        let c = self.sets_cursor.as_ref()?;
+        self.sets.iter().find(|s| &s.item == c).cloned()
+    }
+
+    fn sets_cursor_group(&self) -> Option<&'static str> {
+        let c = self.sets_cursor.as_ref()?;
+        match c.strip_prefix('\u{1}') {
+            Some(name) => SET_GROUPS.iter().find(|g| **g == name).copied(),
+            None => Some(self.set_group(c)),
+        }
+    }
+
+    fn set_group_open(&mut self, group: &'static str, open: bool) {
+        if open {
+            self.sets_open.insert(group.to_string());
+        } else {
+            self.sets_open.remove(group);
+            self.sets_cursor = Some(format!("\u{1}{group}")); // don't leave the cursor in a closed group
+        }
+    }
+
+    fn activate_set_row(&mut self) {
+        match self.selected_set() {
+            Some(_) => self.set_item_menu(),
+            None => {
+                if let Some(g) = self.sets_cursor_group().or(SET_GROUPS.first().copied()) {
+                    let open = self.sets_open.contains(g);
+                    self.sets_cursor.get_or_insert_with(|| format!("\u{1}{g}"));
+                    self.set_group_open(g, !open);
+                }
+            }
+        }
+    }
+
+    fn set_item_menu(&mut self) {
+        let Some(s) = self.selected_set() else {
+            let Some(g) = self.sets_cursor_group() else { return };
+            let open = self.sets_open.contains(g);
+            self.menu = Some(Menu { title: g.into(), items: vec![(if open { "Close" } else { "Open" }.into(), Act::Fold)], sel: 0 });
+            return;
+        };
+        let info = self.set_info(&s.item, &s.system);
+        let mut items = Vec::new();
+        if !info.system.is_empty() {
+            items.push((format!("Search {}", systems::label(&info.system)), Act::SetSearch));
+        }
+        items.push((if self.indexing.contains(&s.item) { "Indexing…" } else { "Index again now" }.into(), Act::Reindex));
+        items.push(("Close".into(), Act::Close));
+        self.menu = Some(Menu { title: info.title, items, sel: 0 });
+    }
+
+    /// Jump to Search with the set's system as the filter, ready to type a title.
+    fn search_set_system(&mut self) {
+        let Some(s) = self.selected_set() else { return };
+        let sys = self.set_info(&s.item, &s.system).system;
+        self.set_tab(Tab::Search);
+        self.rom_query = format!("{sys} ");
+        self.editing = true;
+        self.on_query_change();
+    }
+
+    fn reindex_selected_set(&mut self) {
+        let Some(s) = self.selected_set() else { return };
+        if tbzips::parse_key(&s.item).is_some_and(|h| !self.tb_zips.contains_key(h)) {
+            self.status = "that torrent is no longer on TorBox".into();
+            return;
+        }
+        self.index_errors.remove(&s.item);
+        self.start_index(s.item.clone());
+        self.status = format!("indexing {} again…", self.set_info(&s.item, &s.system).title);
     }
 
     // ---------- library ----------
@@ -2197,7 +2610,7 @@ impl App {
             if g.kind != SourceKind::Link {
                 self.status = "magnets can only be downloaded through TorBox".into();
             } else if g.system.is_empty() {
-                self.status = "pick a system with s/S first".into();
+                self.status = "pick a system with S first".into();
             } else {
                 self.status = format!("downloading {} directly…", g.name);
                 self.start_local(g, false);
@@ -2371,7 +2784,7 @@ impl App {
         match self.tab {
             Tab::Search => &mut self.rom_query,
             Tab::Library if self.lib_input == LibInput::Paste => &mut self.lib_paste,
-            Tab::Library | Tab::Textures => &mut self.lib_filter, // Textures has no text box
+            Tab::Library | Tab::Textures | Tab::Sources => &mut self.lib_filter, // Textures/Sources have no text box
         }
     }
 
@@ -2379,7 +2792,7 @@ impl App {
         match self.tab {
             Tab::Search => self.on_query_change(),
             Tab::Library if self.lib_input == LibInput::Filter => self.fix_cursor(),
-            Tab::Library | Tab::Textures => {}
+            Tab::Library | Tab::Textures | Tab::Sources => {}
         }
     }
 
@@ -2435,7 +2848,7 @@ impl App {
         let code = match p {
             Pad::A => K::Enter,
             Pad::B => K::Char(' '),
-            Pad::X | Pad::View if self.tab == Tab::Textures => return,
+            Pad::X | Pad::View if matches!(self.tab, Tab::Textures | Tab::Sources) => return,
             Pad::X | Pad::View => {
                 self.press(K::Char('/'));
                 gamepad::open_steam_keyboard();
@@ -2463,10 +2876,25 @@ impl App {
         let title;
         match self.tab {
             Tab::Textures => return self.tex_item_menu(),
+            Tab::Sources => return self.set_item_menu(),
             Tab::Search => {
-                let Some(h) = self.rom_state.selected().and_then(|i| self.rom_hits.get(i)) else { return };
+                let Some(hits) = self.selected_hits().map(<[usize]>::to_vec) else {
+                    let Some(sys) = self.search_cursor_system() else { return };
+                    let collapsed = self.search_collapsed.contains(&sys);
+                    self.menu = Some(Menu {
+                        title: systems::label(&sys).to_string(),
+                        items: vec![(if collapsed { "Expand" } else { "Collapse" }.into(), Act::Fold)],
+                        sel: 0,
+                    });
+                    return;
+                };
+                let h = &self.rom_hits[hits[0]];
                 title = h.title.clone().unwrap_or_else(|| h.name.rsplit('/').next().unwrap_or(&h.name).to_string());
-                items.push((if self.lib.contains(&h.url) { "Already in library" } else { "Add to library" }.into(), Act::AddRom));
+                let in_lib = hits.iter().any(|&i| self.lib.contains(&self.rom_hits[i].url));
+                items.push((if in_lib { "Already in library" } else { "Add to library (best source)" }.into(), Act::AddRom));
+                if hits.len() > 1 {
+                    items.push((format!("Choose a source… ({})", hits.len()), Act::Sources));
+                }
                 items.push((system_label(&h.system), Act::System));
             }
             Tab::Library => match self.lib_cursor.clone() {
@@ -2542,6 +2970,11 @@ impl App {
                 ));
                 "Textures"
             }
+            Tab::Sources => {
+                items.push(("Open all groups".into(), Act::ExpandAll));
+                items.push(("Close all groups".into(), Act::CollapseAll));
+                "Sources"
+            }
         };
         items.push(("Quit romgetter".into(), Act::Quit));
         self.menu = Some(Menu { title: title.into(), items, sel: 0 });
@@ -2575,9 +3008,9 @@ impl App {
     fn change_system_in_menu(&mut self, delta: isize) {
         self.cycle_system(delta);
         let sys = match self.tab {
-            Tab::Search => self.rom_state.selected().and_then(|i| self.rom_hits.get(i)).map(|h| h.system.clone()),
+            Tab::Search => self.selected_hit().map(|h| h.system.clone()),
             Tab::Library => self.selected_game().map(|g| g.system.clone()),
-            Tab::Textures => None,
+            Tab::Textures | Tab::Sources => None,
         };
         if let (Some(sys), Some(m)) = (sys, self.menu.as_mut()) {
             m.items[m.sel].0 = system_label(&sys);
@@ -2587,6 +3020,8 @@ impl App {
     fn run(&mut self, act: Act) {
         match act {
             Act::AddRom => self.add_selected_rom(),
+            Act::AddSource(i) => self.add_hit(i),
+            Act::Sources => self.open_source_menu(),
             Act::Download => self.download_selected(false),
             Act::DownloadDirect => self.download_selected(true),
             Act::System | Act::Close => {} // System changes in place (on_menu_key); Close just closes
@@ -2606,6 +3041,18 @@ impl App {
             Act::DeleteYes => {
                 self.confirm_delete = self.selected_game().map(|g| (g.id.clone(), Instant::now()));
                 self.delete_selected_from_disk();
+            }
+            Act::Fold if self.tab == Tab::Sources => {
+                if let Some(g) = self.sets_cursor_group() {
+                    let open = self.sets_open.contains(g);
+                    self.set_group_open(g, !open);
+                }
+            }
+            Act::Fold if self.tab == Tab::Search => {
+                if let Some(sys) = self.search_cursor_system() {
+                    let c = self.search_collapsed.contains(&sys);
+                    self.set_search_collapsed(&sys, !c);
+                }
             }
             Act::Fold => self.toggle_current_group(),
             Act::TopGames => self.add_top_games(),
@@ -2628,8 +3075,12 @@ impl App {
                 gamepad::open_steam_keyboard();
             }
             Act::Sort => self.press(KeyCode::Char('o')),
+            Act::CollapseAll if self.tab == Tab::Sources => self.sets_open.clear(),
+            Act::ExpandAll if self.tab == Tab::Sources => self.sets_open = SET_GROUPS.iter().map(ToString::to_string).collect(),
             Act::CollapseAll => self.set_all_collapsed(true),
             Act::ExpandAll => self.set_all_collapsed(false),
+            Act::SetSearch => self.search_set_system(),
+            Act::Reindex => self.reindex_selected_set(),
             Act::Rescan => self.press(KeyCode::Char('r')),
             Act::ToggleVimm => self.toggle_vimm(),
             Act::TexInstall(_) | Act::TexOpenUrl(_) | Act::TexToggle | Act::TexRemove | Act::TexPage | Act::TexRefresh => self.tex_run(act),
@@ -2672,7 +3123,7 @@ impl App {
                             }
                         }
                         Tab::Library if self.lib_input == LibInput::Paste => self.add_pasted_link(),
-                        Tab::Library | Tab::Textures => {}
+                        Tab::Library | Tab::Textures | Tab::Sources => {}
                     }
                 }
                 KeyCode::Backspace => {
@@ -2696,9 +3147,10 @@ impl App {
             KeyCode::Char('1') => self.set_tab(Tab::Search),
             KeyCode::Char('2') => self.set_tab(Tab::Library),
             KeyCode::Char('3') => self.set_tab(Tab::Textures),
+            KeyCode::Char('4') => self.set_tab(Tab::Sources),
             KeyCode::Tab => self.next_tab(1),
             KeyCode::BackTab => self.next_tab(-1),
-            KeyCode::Char('/' | 'i') if self.tab == Tab::Textures => {}
+            KeyCode::Char('/' | 'i') if matches!(self.tab, Tab::Textures | Tab::Sources) => {}
             KeyCode::Char('/' | 'i') => {
                 if self.tab == Tab::Library {
                     self.lib_input = LibInput::Filter;
@@ -2709,11 +3161,29 @@ impl App {
             KeyCode::Up | KeyCode::Char('k') => self.move_sel(-1),
             KeyCode::PageDown => self.move_sel(15),
             KeyCode::PageUp => self.move_sel(-15),
-            KeyCode::Char(c @ ('s' | 'S')) => self.cycle_system(if c == 's' { 1 } else { -1 }),
+            // s: the main Search box from any tab (/ searches within the current tab)
+            KeyCode::Char('s') => {
+                self.set_tab(Tab::Search);
+                self.editing = true;
+            }
+            KeyCode::Char('S') => self.cycle_system(1),
             KeyCode::Char('m') => self.open_tab_menu(),
             code => match (self.tab, code) {
-                (Tab::Search, KeyCode::Enter | KeyCode::Char('a')) => self.add_selected_rom(),
+                (Tab::Search, KeyCode::Enter) => self.activate_search_row(),
+                (Tab::Search, KeyCode::Char('a')) => self.add_selected_rom(),
+                (Tab::Search, KeyCode::Left | KeyCode::Right | KeyCode::Char('h' | 'l')) => {
+                    if let Some(sys) = self.search_cursor_system() {
+                        self.set_search_collapsed(&sys, matches!(code, KeyCode::Left | KeyCode::Char('h')));
+                    }
+                }
                 (Tab::Textures, KeyCode::Enter) => self.tex_activate(),
+                (Tab::Sources, KeyCode::Enter) => self.activate_set_row(),
+                (Tab::Sources, KeyCode::Left | KeyCode::Right | KeyCode::Char('h' | 'l')) => {
+                    if let Some(g) = self.sets_cursor_group() {
+                        let open = matches!(code, KeyCode::Right | KeyCode::Char('l'));
+                        self.set_group_open(g, open);
+                    }
+                }
                 (Tab::Textures, KeyCode::Char('r')) => self.tex_fetch(),
                 (Tab::Library, KeyCode::Enter) => self.activate_row(),
                 (_, KeyCode::Char(' ')) => self.open_item_menu(),
@@ -2763,11 +3233,14 @@ impl App {
     fn cycle_system(&mut self, delta: isize) {
         match self.tab {
             Tab::Search => {
-                if let Some(h) = self.rom_state.selected().and_then(|i| self.rom_hits.get_mut(i)) {
-                    h.system = systems::cycle(&h.system, delta).to_string();
+                // every source of the game moves; the row regroups on the next refresh
+                let Some(hits) = self.selected_hits().map(<[usize]>::to_vec) else { return };
+                let sys = systems::cycle(&self.rom_hits[hits[0]].system, delta).to_string();
+                for i in hits {
+                    self.rom_hits[i].system.clone_from(&sys);
                 }
             }
-            Tab::Textures => {}
+            Tab::Textures | Tab::Sources => {}
             Tab::Library => {
                 let roms = self.ctx.roms_dir.clone();
                 let Some(id) = self.selected_game().map(|g| g.id.clone()) else { return };
@@ -2803,6 +3276,15 @@ impl App {
         if self.tab == Tab::Textures {
             return self.tex_move(delta);
         }
+        if self.tab == Tab::Sources {
+            let keys: Vec<String> = self.set_rows().iter().map(Self::set_row_key).collect();
+            if keys.is_empty() {
+                return;
+            }
+            let cur = self.sets_cursor.as_ref().and_then(|c| keys.iter().position(|k| k == c)).unwrap_or(0) as isize;
+            self.sets_cursor = Some(keys[(cur + delta).clamp(0, keys.len() as isize - 1) as usize].clone());
+            return;
+        }
         if self.tab == Tab::Library {
             let keys = self.row_keys();
             if keys.is_empty() {
@@ -2817,7 +3299,7 @@ impl App {
             self.lib_cursor = Some(keys[(cur + delta).clamp(0, keys.len() as isize - 1) as usize].clone());
             return;
         }
-        let len = self.rom_hits.len();
+        let len = self.search_rows.len();
         if len == 0 {
             return;
         }
@@ -2837,6 +3319,138 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn search_groups_sources_by_game() {
+        let mut app = test_app(Vec::new());
+        app.tab = Tab::Search;
+        app.editing = false;
+        app.tb_zips.insert(
+            "aa".into(),
+            tbzips::Candidate { id: 1, hash: "aa".into(), system: "psx".into(), title: "1G1R PS1".into(), zipped: true, inner: None },
+        );
+        let hit = |name: &str, system: &str, source: &str, live: bool, torrent: Option<&str>| RomHit {
+            url: format!("{source}/{name}"),
+            name: name.into(),
+            size: 1,
+            system: system.into(),
+            source: source.into(),
+            live,
+            torrent: torrent.map(|h| (h.to_string(), None)),
+            title: None,
+        };
+        app.local_hits = vec![
+            hit("Crash Bandicoot (USA).zip", "psx", "redump-set", false, None),
+            hit("Crash Bandicoot (USA).7z", "psx", "1G1R PS1", false, Some("aa")),
+            hit("Crash Bandicoot (Japan).7z", "psx", "1G1R PS1", false, Some("aa")),
+            hit("Super Mario World (USA).zip", "snes", "nointro", false, None),
+        ];
+        app.live_hits = vec![hit("crash_bandicoot_(usa).ZIP", "psx", "archive.org/x", true, None)];
+        app.merge_hits();
+        let shape: Vec<String> = app
+            .search_rows
+            .iter()
+            .map(|r| match r {
+                SearchRow::Header { system, count, .. } => format!("H {system} {count}"),
+                SearchRow::Game(h) => format!("G {} {}", app.rom_hits[h[0]].source, h.len()),
+            })
+            .collect();
+        assert!(shape.contains(&"H psx 1".to_string()) && shape.contains(&"H snes 1".to_string()), "{shape:?}");
+        assert!(shape.contains(&"G 1G1R PS1 4".to_string()), "cached TorBox copy first: {shape:?}");
+        assert!(matches!(app.search_rows[app.rom_state.selected().unwrap()], SearchRow::Game(_)), "starts on a game");
+
+        // Enter on the PS1 game lists its sources, ⚡ first, live last
+        let psx = app.search_rows.iter().position(|r| matches!(r, SearchRow::Game(h) if h.len() == 4)).unwrap();
+        app.rom_state.select(Some(psx));
+        app.press(KeyCode::Enter);
+        let m = app.menu.as_ref().expect("source menu");
+        let labels: Vec<&str> = m.items.iter().map(|(l, _)| l.as_str()).collect();
+        // cached first (USA before Japan), then the uncached USA copies, live last
+        assert!(labels[0].starts_with('⚡') && labels[0].contains("(USA)"), "{labels:?}");
+        assert!(labels[1].starts_with('⚡') && labels[1].contains("(Japan)"), "{labels:?}");
+        assert!(labels[2].contains("redump-set") && labels[3].contains("archive.org/x"), "{labels:?}");
+        app.press(KeyCode::Down);
+        app.press(KeyCode::Down);
+        app.press(KeyCode::Enter);
+        assert!(app.lib.contains("redump-set/Crash Bandicoot (USA).zip"));
+
+        // Enter on a header folds its system
+        let h = app.search_rows.iter().position(|r| matches!(r, SearchRow::Header { system, .. } if system == "psx")).unwrap();
+        app.rom_state.select(Some(h));
+        app.press(KeyCode::Enter);
+        assert!(matches!(&app.search_rows[h], SearchRow::Header { collapsed: true, .. }));
+        assert!(!app.search_rows.iter().any(|r| matches!(r, SearchRow::Game(x) if x.len() == 4)));
+    }
+
+    #[tokio::test]
+    async fn sources_tab_groups_sets() {
+        let mut app = test_app(Vec::new());
+        let idx = |n: usize, restricted: bool| ItemIndex {
+            restricted,
+            files: (0..n)
+                .map(|i| archive::RomFile {
+                    name: format!("g{i}.zip"),
+                    size: 10,
+                    url: None,
+                    torrent_index: None,
+                    title: None,
+                    system: None,
+                })
+                .collect(),
+            system: None,
+            title: String::new(),
+            fetched: 0,
+            btih: None,
+        };
+        for (item, sys) in [
+            (minerva::set_key("Redump", "Sony - PlayStation"), "psx"),
+            (minerva::set_key("No-Intro", "Nintendo - Game Boy"), "gb"),
+            ("nointro.md".to_string(), "megadrive"),
+            ("microsoft_xbox360_a_part1".to_string(), "xbox360"),
+        ] {
+            app.sets.push(SetRef { item, system: sys.into() });
+        }
+        app.index.insert(minerva::set_key("Redump", "Sony - PlayStation"), idx(3, false));
+        app.index.insert("nointro.md".into(), idx(2, false));
+        app.index.insert("microsoft_xbox360_a_part1".into(), idx(5, true));
+        app.index_errors.insert(minerva::set_key("No-Intro", "Nintendo - Game Boy"), "HTTP 500".into());
+        app.tab = Tab::Sources;
+        app.editing = false;
+        let shape = |app: &App| -> Vec<String> {
+            app.set_rows()
+                .iter()
+                .map(|r| match r {
+                    SetRow::Group { name, sets, files, collapsed } => {
+                        format!("G {name} {sets} {files}{}", if *collapsed { " closed" } else { "" })
+                    }
+                    SetRow::Set(item) => format!("S {item}"),
+                })
+                .collect()
+        };
+        assert_eq!(
+            shape(&app),
+            vec![
+                "G Minerva · No-Intro 1 0 closed",
+                "G Minerva · Redump 1 3 closed",
+                "G archive.org · built-in sets 1 2 closed",
+                "G archive.org · restricted (romgetter archive-login) 1 5 closed",
+            ]
+        );
+        // Enter on the first group opens it; its failed set shows why
+        app.press(KeyCode::Enter);
+        assert_eq!(app.sets_cursor.as_deref(), Some("\u{1}Minerva · No-Intro"));
+        assert_eq!(shape(&app)[1], format!("S {}", minerva::set_key("No-Intro", "Nintendo - Game Boy")));
+        app.press(KeyCode::Down);
+        let info = app.set_info(&minerva::set_key("No-Intro", "Nintendo - Game Boy"), "gb");
+        assert!(matches!(info.state, SetState::Failed(ref e) if e == "HTTP 500"));
+        assert_eq!(info.title, "Nintendo - Game Boy");
+        assert!(matches!(app.set_info("microsoft_xbox360_a_part1", "xbox360").state, SetState::Locked));
+        // Enter on a set: its actions; "Search" jumps to the Search tab filtered to its system
+        app.press(KeyCode::Enter);
+        assert_eq!(app.menu.as_ref().map(|m| m.items[0].1), Some(Act::SetSearch));
+        app.press(KeyCode::Enter);
+        assert!(app.tab == Tab::Search && app.editing && app.rom_query == "gb ");
+    }
 
     fn test_app(games: Vec<Game>) -> App {
         // one folder per test app: tests run in parallel and write to their roms folders
@@ -2885,7 +3499,8 @@ mod tests {
     async fn hides_minerva_files_torbox_lacks() {
         let mut app = test_app(Vec::new());
         let h = "626a5e05f498e435145c97352aa2fecf7e95a668".to_string();
-        let file = |n: &str| archive::RomFile { name: n.into(), size: 14 << 30, url: None, torrent_index: Some(1), title: None };
+        let file =
+            |n: &str| archive::RomFile { name: n.into(), size: 14 << 30, url: None, torrent_index: Some(1), title: None, system: None };
         app.sets.push(SetRef { item: minerva::set_key("Redump", "Sony - PlayStation 3"), system: "ps3".into() });
         app.index.insert(
             minerva::set_key("Redump", "Sony - PlayStation 3"),
@@ -2930,6 +3545,7 @@ mod tests {
                     url: None,
                     torrent_index: Some(171),
                     title: None,
+                    system: None,
                 }],
                 system: Some("ps3".into()),
                 title: "Minerva · Redump · Sony - PlayStation 3".into(),
@@ -2952,7 +3568,7 @@ mod tests {
     #[tokio::test]
     async fn top_list_matching() {
         let mut app = test_app(Vec::new());
-        let file = |n: &str| archive::RomFile { name: n.into(), size: 1, url: None, torrent_index: None, title: None };
+        let file = |n: &str| archive::RomFile { name: n.into(), size: 1, url: None, torrent_index: None, title: None, system: None };
         app.sets.push(SetRef { item: "x360".into(), system: "xbox360".into() });
         app.index.insert(
             "x360".into(),
@@ -3146,6 +3762,7 @@ mod tests {
                     url: None,
                     torrent_index: Some(1),
                     title: None,
+                    system: None,
                 }],
                 system: Some("ps3".into()),
                 title: "Minerva · Redump · Sony - PlayStation 3".into(),
@@ -3245,7 +3862,11 @@ mod tests {
         app.on_pad(Pad::RB);
         assert!(app.tab == Tab::Textures);
         app.on_pad(Pad::RB);
+        assert!(app.tab == Tab::Sources);
+        app.on_pad(Pad::RB);
         assert!(app.tab == Tab::Search, "wraps around");
+        app.on_pad(Pad::LB);
+        assert!(app.tab == Tab::Sources);
         app.on_pad(Pad::LB);
         assert!(app.tab == Tab::Textures);
         app.on_pad(Pad::LB);

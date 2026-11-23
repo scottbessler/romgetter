@@ -96,6 +96,51 @@ async fn direct(game: &Game, ctx: &Ctx, send: &impl Fn(LocalState)) -> Result<Ve
 /// stops using TorBox for that folder for a while).
 pub const BROKEN_TORBOX_ZIP: &str = "TorBox's copy is broken";
 
+/// Pull `pick` out of `zip`, one file of TorBox item `id` (a zip TorBox packed, or a
+/// collection zip inside the torrent). Ok(Err(n)): the zip's n entries don't include it.
+#[allow(clippy::too_many_arguments)]
+async fn from_zip(
+    tb: &TorBox,
+    kind: crate::torbox::Kind,
+    id: u64,
+    zip: &crate::torbox::RemoteFile,
+    game: &Game,
+    pick: &str,
+    ctx: &Ctx,
+    send: &impl Fn(LocalState),
+) -> Result<Result<Vec<String>, usize>> {
+    if game.system.is_empty() {
+        bail!("no system selected; set one with S");
+    }
+    let url = tb.request_dl(kind, id, zip.id).await?;
+    // TorBox sometimes lists a packed zip at the folder's full size but serves only
+    // the first part of it (seen: 2.5 GB of an 898 GB Saturn zip), with no directory.
+    let claimed = zip.size as u64;
+    if let Some(served) = crate::remotezip::served_size(&ctx.http, &url).await.context("reading TorBox's zip")?
+        && served < claimed
+    {
+        bail!("{BROKEN_TORBOX_ZIP}: its zip of this folder is cut off ({} of {})", crate::ui::human(served), crate::ui::human(claimed));
+    }
+    let entries =
+        crate::remotezip::list(&ctx.http, &url).await.map_err(|e| anyhow!("{BROKEN_TORBOX_ZIP}: {e:#}")).context("reading TorBox's zip")?;
+    let want = pick.to_lowercase();
+    let Some(entry) = entries.iter().find(|e| e.base_name().to_lowercase() == want) else {
+        return Ok(Err(entries.len()));
+    };
+    let rel = format!("{}/{}", game.system, sanitize(pick));
+    ensure_dir(ctx, &game.system).await?;
+    let dest = ctx.roms_dir.join(&rel);
+    if !tokio::fs::metadata(&dest).await.map(|m| m.len() > 0).unwrap_or(false) {
+        let file = sanitize(pick);
+        send(LocalState::Downloading { file: file.clone(), done: 0, total: entry.compressed });
+        crate::remotezip::extract(&ctx.http, &url, entry, &dest, &|done, total| {
+            send(LocalState::Downloading { file: file.clone(), done, total });
+        })
+        .await?;
+    }
+    Ok(Ok(vec![rel]))
+}
+
 async fn from_torbox(game: &Game, ctx: &Ctx, send: &impl Fn(LocalState)) -> Result<Vec<String>> {
     let tb = ctx.torbox.as_ref().ok_or_else(|| anyhow!("no TorBox API key configured"))?;
     let kind = game.torbox_kind();
@@ -106,39 +151,10 @@ async fn from_torbox(game: &Game, ctx: &Ctx, send: &impl Fn(LocalState)) -> Resu
     }
     // TorBox zipped the whole torrent (account setting): read just our file out of the zip.
     if let (Some(pick), true) = (&game.pick, item.is_zipped()) {
-        if game.system.is_empty() {
-            bail!("no system selected; set one with s/S");
-        }
-        let url = tb.request_dl(kind, id, item.files[0].id).await?;
-        // TorBox sometimes lists a packed zip at the folder's full size but serves only
-        // the first part of it (seen: 2.5 GB of an 898 GB Saturn zip), with no directory.
-        let claimed = item.files[0].size as u64;
-        if let Some(served) = crate::remotezip::served_size(&ctx.http, &url).await.context("reading TorBox's zip")?
-            && served < claimed
-        {
-            bail!("{BROKEN_TORBOX_ZIP}: its zip of this folder is cut off ({} of {})", crate::ui::human(served), crate::ui::human(claimed));
-        }
-        let entries = crate::remotezip::list(&ctx.http, &url)
-            .await
-            .map_err(|e| anyhow!("{BROKEN_TORBOX_ZIP}: {e:#}"))
-            .context("reading TorBox's zip")?;
-        let want = pick.to_lowercase();
-        let entry = entries
-            .iter()
-            .find(|e| e.base_name().to_lowercase() == want)
-            .ok_or_else(|| anyhow!("'{pick}' isn't in TorBox's zip of this torrent ({} entries)", entries.len()))?;
-        let rel = format!("{}/{}", game.system, sanitize(pick));
-        ensure_dir(ctx, &game.system).await?;
-        let dest = ctx.roms_dir.join(&rel);
-        if !tokio::fs::metadata(&dest).await.map(|m| m.len() > 0).unwrap_or(false) {
-            let file = sanitize(pick);
-            send(LocalState::Downloading { file: file.clone(), done: 0, total: entry.size });
-            crate::remotezip::extract(&ctx.http, &url, entry, &dest, &|done, total| {
-                send(LocalState::Downloading { file: file.clone(), done, total });
-            })
-            .await?;
-        }
-        return Ok(vec![rel]);
+        return match from_zip(tb, kind, id, &item.files[0], game, pick, ctx, send).await? {
+            Ok(files) => Ok(files),
+            Err(n) => bail!("'{pick}' isn't in TorBox's zip of this torrent ({n} entries)"),
+        };
     }
 
     let mut files: Vec<_> = item.files.iter().filter(|f| !is_junk(&f.file_name())).collect();
@@ -149,8 +165,16 @@ async fn from_torbox(game: &Game, ctx: &Ctx, send: &impl Fn(LocalState)) -> Resu
             .iter()
             .find(|f| f.file_name().to_lowercase() == want)
             .or_else(|| game.torrent_index.filter(|_| !item.is_partial()).and_then(|i| files.iter().find(|f| f.id == u64::from(i))))
-            .copied()
-            .ok_or_else(|| anyhow!("not cached: TorBox has only {} file(s) of this torrent, and '{pick}' isn't one", item.real_files()))?;
+            .copied();
+        let Some(found) = found else {
+            // a collection zip among the torrent's files ("NES_Test_Collection/NES.zip")
+            for zip in item.inner_zips() {
+                if let Ok(files) = from_zip(tb, kind, id, zip, game, pick, ctx, send).await? {
+                    return Ok(files);
+                }
+            }
+            bail!("not cached: TorBox has only {} file(s) of this torrent, and '{pick}' isn't one", item.real_files());
+        };
         files = vec![found];
     }
     if files.is_empty() {
@@ -167,7 +191,7 @@ async fn from_torbox(game: &Game, ctx: &Ctx, send: &impl Fn(LocalState)) -> Resu
         let system = if game.system.is_empty() {
             systems::guess_for_file(&f.name)
                 .or(item_guess)
-                .ok_or_else(|| anyhow!("couldn't detect a system for '{}'; set one with s/S and retry", f.name))?
+                .ok_or_else(|| anyhow!("couldn't detect a system for '{}'; set one with S and retry", f.name))?
                 .to_string()
         } else {
             game.system.clone()
@@ -204,7 +228,7 @@ async fn from_rd(game: &Game, ctx: &Ctx, send: &impl Fn(LocalState)) -> Result<V
 
 async fn ensure_dir(ctx: &Ctx, system: &str) -> Result<PathBuf> {
     if system.is_empty() {
-        bail!("no system selected; set one with s/S");
+        bail!("no system selected; set one with S");
     }
     let dir = ctx.roms_dir.join(system);
     tokio::fs::create_dir_all(&dir).await.with_context(|| format!("creating {}", dir.display()))?;

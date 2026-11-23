@@ -136,7 +136,7 @@ pub fn parse_index(xml: &str) -> Vec<RomFile> {
         let title = tag(chunk, "description").and_then(title_from_description);
         // games/zcode/x.z5 is a main release; competition and language folders go after.
         let main = dirs.len() == 2;
-        out.push((main, RomFile { name: rel.to_string(), size, url: Some(url), torrent_index: None, title }));
+        out.push((main, RomFile { name: rel.to_string(), size, url: Some(url), torrent_index: None, title, system: None }));
     }
     out.sort_by(|(am, a), (bm, b)| bm.cmp(am).then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase())));
     out.into_iter().map(|(_, f)| f).collect()

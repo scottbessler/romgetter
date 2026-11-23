@@ -8,6 +8,7 @@
 use anyhow::{Context, Result, anyhow, bail};
 use futures_util::StreamExt;
 use reqwest::header::{CONTENT_RANGE, RANGE};
+use std::io::Write as _;
 use std::path::Path;
 use std::time::{Duration, Instant};
 use tokio::io::AsyncWriteExt;
@@ -105,6 +106,11 @@ fn parse_cd(cd: &[u8]) -> Result<Vec<Entry>> {
     Ok(out)
 }
 
+/// Compression methods `extract` can read: stored and deflate.
+pub fn is_supported(method: u16) -> bool {
+    matches!(method, 0 | 8)
+}
+
 /// List a remote zip's entries (two small range requests).
 pub async fn list(http: &reqwest::Client, url: &str) -> Result<Vec<Entry>> {
     list_sized(http, url).await.map(|(e, _)| e)
@@ -127,10 +133,10 @@ async fn list_from_tail(http: &reqwest::Client, url: &str, tail: &[u8]) -> Resul
     parse_cd(&cd)
 }
 
-/// Copy one stored (uncompressed) entry to `dest`, reporting (done, total) bytes.
+/// Copy one entry to `dest`, stored or deflated, reporting (done, total) compressed bytes.
 pub async fn extract(http: &reqwest::Client, url: &str, e: &Entry, dest: &Path, progress: &impl Fn(u64, u64)) -> Result<()> {
-    if e.method != 0 {
-        bail!("'{}' is compressed inside TorBox's zip (method {}); not supported", e.name, e.method);
+    if !is_supported(e.method) {
+        bail!("'{}' uses zip compression method {}; only stored and deflated entries are supported", e.name, e.method);
     }
     let (lh, _) = range(http, url, &format!("{}-{}", e.local_header, e.local_header + 29)).await?;
     if lh.len() < 30 || &lh[..4] != b"PK\x03\x04" {
@@ -139,13 +145,21 @@ pub async fn extract(http: &reqwest::Client, url: &str, e: &Entry, dest: &Path, 
     let start = e.local_header + 30 + u64::from(u16le(&lh, 26)) + u64::from(u16le(&lh, 28));
     let part = dest.with_extension("part");
     let mut out = tokio::fs::File::create(&part).await.with_context(|| format!("creating {}", part.display()))?;
+    let mut inflate = (e.method == 8).then(|| flate2::write::DeflateDecoder::new(Vec::new()));
     if e.compressed > 0 {
         let resp = http.get(url).header(RANGE, format!("bytes={start}-{}", start + e.compressed - 1)).send().await?.error_for_status()?;
         let mut stream = resp.bytes_stream();
         let (mut done, mut last) = (0u64, Instant::now());
         while let Some(chunk) = stream.next().await {
             let chunk = chunk?;
-            out.write_all(&chunk).await?;
+            match inflate.as_mut() {
+                Some(d) => {
+                    d.write_all(&chunk).with_context(|| format!("inflating '{}'", e.name))?;
+                    out.write_all(d.get_ref()).await?;
+                    d.get_mut().clear();
+                }
+                None => out.write_all(&chunk).await?,
+            }
             done += chunk.len() as u64;
             if last.elapsed() > Duration::from_millis(250) {
                 progress(done, e.compressed);
@@ -155,6 +169,9 @@ pub async fn extract(http: &reqwest::Client, url: &str, e: &Entry, dest: &Path, 
         if done != e.compressed {
             bail!("short read: got {done} of {} bytes", e.compressed);
         }
+    }
+    if let Some(d) = inflate {
+        out.write_all(&d.finish().with_context(|| format!("inflating '{}'", e.name))?).await?;
     }
     out.flush().await?;
     drop(out);

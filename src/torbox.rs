@@ -79,6 +79,9 @@ pub struct Item {
     pub files: Vec<RemoteFile>,
 }
 
+/// A zip at least this big inside a loose torrent is a collection, not one game.
+pub const INNER_ZIP_MIN: f64 = 500_000_000.0;
+
 impl Item {
     pub fn is_zipped(&self) -> bool {
         self.files.len() == 1 && (self.files[0].zipped || self.allow_zipped)
@@ -93,6 +96,19 @@ impl Item {
         self.is_zipped()
             || self.files.iter().any(|f| f.file_name().to_lowercase() == want)
             || index.is_some_and(|i| !self.is_partial() && self.files.iter().any(|f| f.id == u64::from(i)))
+            || self.inner_zips().next().is_some()
+    }
+
+    /// Big zips among a whole torrent's loose files ("NES_Test_Collection/NES.zip"):
+    /// collections whose games are pulled out one at a time, largest first.
+    pub fn inner_zips(&self) -> impl Iterator<Item = &RemoteFile> {
+        let mut zips: Vec<&RemoteFile> = if self.is_zipped() || self.is_partial() {
+            Vec::new()
+        } else {
+            self.files.iter().filter(|f| f.size >= INNER_ZIP_MIN && has_ext(&f.name, "zip")).collect()
+        };
+        zips.sort_by(|a, b| b.size.total_cmp(&a.size));
+        zips.into_iter()
     }
 
     /// Only part of the torrent is here; file ids then don't match torrent indices.
@@ -210,20 +226,31 @@ impl TorBox {
         Ok(serde_json::from_value(obj)?)
     }
 
-    /// All items of one kind in the account (one request, used for polling).
+    /// All items of one kind in the account (used for polling). TorBox pages the list
+    /// newest first, 1000 at a time.
     pub async fn list(&self, kind: Kind) -> Result<Vec<Item>> {
-        let data = self
-            .call(
-                self.http
-                    .get(format!("{BASE}/{}/mylist", kind.path()))
-                    .bearer_auth(&self.key)
-                    .query(&[("bypass_cache", "true"), ("limit", "1000")]),
-            )
-            .await?;
-        match data {
-            Value::Array(items) => Ok(items.into_iter().filter_map(|v| serde_json::from_value(v).ok()).collect()),
-            Value::Null => Ok(Vec::new()),
-            other => bail!("TorBox mylist: unexpected response {other}"),
+        const PAGE: usize = 1000;
+        let (mut out, mut seen) = (Vec::new(), 0);
+        loop {
+            let offset = seen.to_string();
+            let data = self
+                .call(self.http.get(format!("{BASE}/{}/mylist", kind.path())).bearer_auth(&self.key).query(&[
+                    ("bypass_cache", "true"),
+                    ("limit", "1000"),
+                    ("offset", offset.as_str()),
+                ]))
+                .await?;
+            let page: Vec<Value> = match data {
+                Value::Array(items) => items,
+                Value::Null => Vec::new(),
+                other => bail!("TorBox mylist: unexpected response {other}"),
+            };
+            let n = page.len();
+            seen += n;
+            out.extend(page.into_iter().filter_map(|v| serde_json::from_value(v).ok()));
+            if n < PAGE || seen >= 20 * PAGE {
+                return Ok(out);
+            }
         }
     }
 

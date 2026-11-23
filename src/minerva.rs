@@ -168,7 +168,7 @@ pub async fn fetch_folder(http: &reqwest::Client, group: &str, folder: &str) -> 
         if e.btih.is_some() && e.btih != btih {
             continue;
         }
-        files.push(RomFile { name: e.name, size: e.size, url: None, torrent_index: e.index, title: None });
+        files.push(RomFile { name: e.name, size: e.size, url: None, torrent_index: e.index, title: None, system: None });
     }
     let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
     Ok(ItemIndex {
