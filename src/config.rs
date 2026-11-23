@@ -34,6 +34,10 @@ pub struct Config {
     /// Search the built-in No-Intro/Redump sets (see sources.rs).
     #[serde(default = "yes")]
     pub use_default_sets: bool,
+    /// Search ROM-set torrents already in the TorBox account, zipped by TorBox or loose
+    /// (e.g. "1G1R - Redump - Sony - PlayStation").
+    #[serde(default = "yes")]
+    pub use_torbox_zips: bool,
     /// Search the IF Archive's free interactive fiction (played with Gargoyle).
     #[serde(default = "yes")]
     pub use_ifarchive: bool,
@@ -87,6 +91,7 @@ impl Default for Config {
             poll_secs: default_poll(),
             use_minerva: true,
             use_default_sets: true,
+            use_torbox_zips: true,
             use_ifarchive: true,
             use_vimm: false,
             browser: None,

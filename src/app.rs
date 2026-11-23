@@ -7,6 +7,7 @@ use crate::library::{self, Game, Library, SourceKind};
 use crate::minerva;
 use crate::sources;
 use crate::systems;
+use crate::tbzips;
 use crate::torbox::{Item, Kind};
 use crate::vimm;
 use ratatui::crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
@@ -193,6 +194,8 @@ pub enum Msg {
     MameTitles(anyhow::Result<HashMap<String, String>>),
     Indexed(String, anyhow::Result<ItemIndex>),
     MinervaFolders(String, anyhow::Result<Vec<minerva::Folder>>),
+    /// Zipped ROM-set torrents found in the TorBox account.
+    TorboxZips(anyhow::Result<Vec<tbzips::Candidate>>),
     /// TorBox's cached files per Minerva torrent (hashes asked about, result).
     MinervaCache(Vec<String>, anyhow::Result<HashMap<String, HashSet<String>>>),
     /// A game was put on Real-Debrid (game id, RD torrent id).
@@ -252,6 +255,20 @@ fn save_folders(cache_dir: &Path, group: &str, folders: &[minerva::Folder]) {
     if let Ok(json) = serde_json::to_vec(&c) {
         let _ = std::fs::write(folders_path(cache_dir, group), json);
     }
+}
+
+fn tb_zips_path(cache_dir: &Path) -> PathBuf {
+    cache_dir.join("torbox-zips.json")
+}
+
+/// Search sets for zipped TorBox torrents; they go right after Minerva's.
+fn tb_zip_sets(cands: &[tbzips::Candidate]) -> Vec<SetRef> {
+    cands.iter().map(|c| SetRef { item: c.key(), system: c.system.clone() }).collect()
+}
+
+/// Where new TorBox-zip sets go in the search order: after Minerva's sets.
+fn tb_zip_pos(sets: &[SetRef]) -> usize {
+    sets.iter().take_while(|s| s.item.starts_with("minerva:")).count()
 }
 
 /// Minerva folders up to this size may be fetched uncached: TorBox downloads the whole
@@ -375,6 +392,9 @@ pub struct App {
     pub indexing: HashSet<String>,
     index_permits: Arc<Semaphore>,
     minerva_pending: usize,
+    /// Zipped ROM-set torrents in the TorBox account, by info-hash.
+    tb_zips: HashMap<String, tbzips::Candidate>,
+    tb_zips_pending: bool,
     /// btih → what TorBox has cached of that Minerva torrent (absent = not checked yet).
     pub minerva_cache: HashMap<String, TorrentCache>,
     cache_checked: u64,
@@ -476,6 +496,13 @@ impl App {
                 }
             }
         }
+        // TorBox zips next: instant, since TorBox already has them.
+        let tb_zips: Vec<tbzips::Candidate> = if cfg.use_torbox_zips && ctx.torbox.is_some() {
+            std::fs::read(tb_zips_path(&cache_dir)).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        sets.extend(tb_zip_sets(&tb_zips));
         if cfg.use_default_sets {
             sets.extend(sources::default_sets().into_iter().map(|(item, s)| SetRef { item, system: s.to_string() }));
         }
@@ -498,6 +525,8 @@ impl App {
             indexing: HashSet::new(),
             index_permits: Arc::new(Semaphore::new(4)),
             minerva_pending: 0,
+            tb_zips_pending: false,
+            tb_zips: tb_zips.into_iter().map(|c| (c.hash.clone(), c)).collect(),
             minerva_cache: HashMap::new(),
             cache_checked: 0,
             cache_check_running: false,
@@ -586,6 +615,7 @@ impl App {
         for group in minerva_stale {
             app.refresh_minerva(group);
         }
+        app.refresh_tb_zips();
         if let Some(c) = std::fs::read_to_string(cache_status_path(&app.cache_dir))
             .ok()
             .and_then(|t| serde_json::from_str::<CacheStatusFile>(&t).ok())
@@ -656,7 +686,7 @@ impl App {
 
     /// Still discovering or indexing sets.
     pub fn busy(&self) -> bool {
-        !self.indexing.is_empty() || self.minerva_pending > 0 || self.mame_pending
+        !self.indexing.is_empty() || self.minerva_pending > 0 || self.mame_pending || self.tb_zips_pending
     }
 
     pub fn indexed_sets(&self) -> usize {
@@ -1195,14 +1225,30 @@ impl App {
         let http = self.ctx.http.clone();
         let tx = self.tx.clone();
         let permits = self.index_permits.clone();
+        let tb_zip = tbzips::parse_key(&item).map(|h| (self.tb_zips.get(h).cloned(), self.ctx.torbox.clone()));
         tokio::spawn(async move {
             let _permit = permits.acquire_owned().await;
             let res = match minerva::parse_key(&item) {
+                _ if tb_zip.is_some() => match tb_zip {
+                    Some((Some(c), Some(tb))) => tbzips::fetch_index(&tb, &http, &c).await,
+                    _ => Err(anyhow::anyhow!("not a TorBox torrent any more")),
+                },
                 Some((group, folder)) => minerva::fetch_folder(&http, group, folder).await,
                 None if item == ifarchive::KEY => ifarchive::fetch_index(&http).await,
                 None => archive::fetch_index(&http, &item).await,
             };
             let _ = tx.send(Msg::Indexed(item, res));
+        });
+    }
+
+    /// Look for zipped ROM-set torrents in the TorBox account (the user adds them there).
+    fn refresh_tb_zips(&mut self) {
+        let Some(tb) = self.ctx.torbox.clone().filter(|_| self.cfg.use_torbox_zips) else { return };
+        let tx = self.tx.clone();
+        self.tb_zips_pending = true;
+        tokio::spawn(async move {
+            let res = tb.list(Kind::Torrent).await.map(|items| tbzips::candidates(&items));
+            let _ = tx.send(Msg::TorboxZips(res));
         });
     }
 
@@ -1318,6 +1364,9 @@ impl App {
     }
 
     pub fn on_msg(&mut self, msg: Msg) {
+        if matches!(msg, Msg::TorboxZips(_)) {
+            self.tb_zips_pending = false;
+        }
         match msg {
             Msg::Indexed(item, res) => {
                 self.indexing.remove(&item);
@@ -1472,6 +1521,30 @@ impl App {
                     Err(e) => self.status = format!("checking TorBox's cache failed: {e:#}"),
                 }
             }
+            Msg::TorboxZips(res) => match res {
+                Ok(cands) => {
+                    if let Ok(json) = serde_json::to_vec(&cands) {
+                        let _ = std::fs::create_dir_all(&self.cache_dir);
+                        let _ = std::fs::write(tb_zips_path(&self.cache_dir), json);
+                    }
+                    // torrents removed from TorBox drop out of search
+                    let keep: HashSet<String> = cands.iter().map(tbzips::Candidate::key).collect();
+                    self.sets.retain(|s| tbzips::parse_key(&s.item).is_none() || keep.contains(&s.item));
+                    self.tb_zips = cands.iter().map(|c| (c.hash.clone(), c.clone())).collect();
+                    let new: Vec<SetRef> = tb_zip_sets(&cands).into_iter().filter(|s| !self.sets.iter().any(|x| x.item == s.item)).collect();
+                    let pos = tb_zip_pos(&self.sets);
+                    self.sets.splice(pos..pos, new);
+                    let to_index: Vec<String> = cands
+                        .iter()
+                        .map(tbzips::Candidate::key)
+                        .filter(|k| self.index.get(k).is_none_or(|i| i.age() > REINDEX_AFTER))
+                        .collect();
+                    for item in to_index {
+                        self.start_index(item);
+                    }
+                }
+                Err(e) => self.status = format!("listing TorBox torrents failed: {e:#}"),
+            },
                         Msg::MinervaFolders(group, res) => {
                 self.minerva_pending = self.minerva_pending.saturating_sub(1);
                 match res {

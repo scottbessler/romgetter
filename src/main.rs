@@ -13,6 +13,7 @@ mod realdebrid;
 mod remotezip;
 mod sources;
 mod systems;
+mod tbzips;
 mod textures;
 mod torbox;
 mod ui;
@@ -183,7 +184,8 @@ async fn main() -> Result<()> {
     }
 
     if args.first().map(String::as_str) == Some("search") {
-        let ctx = jobs::Ctx { torbox: None, rd: None, ..ctx };
+        // TorBox stays: its zipped ROM-set torrents are searchable sets
+        let ctx = jobs::Ctx { rd: None, ..ctx };
         let mut app = App::new(cfg, paths.cache_dir.clone(), lib, tx, local_tx, ctx);
         while app.busy() {
             eprint!("\rindexing {}/{} sets…", app.indexed_sets(), app.sets.len());
