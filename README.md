@@ -63,6 +63,7 @@ roms_dir = "/home/deck/retrodeck/roms"
 poll_secs = 5
 use_minerva = true                # search Minerva's No-Intro/Redump torrents
 use_default_sets = true           # search the built-in archive.org sets
+use_ifarchive = true              # search the IF Archive's free interactive fiction
 real_debrid_api_key = "..."       # optional; or export REAL_DEBRID_API_KEY
 use_vimm = false                  # search Vimm's Lair, a last resort (downloads go through a browser)
 browser = "flatpak run org.mozilla.firefox"   # optional; default: Firefox/Chrome, else the system's
@@ -77,6 +78,17 @@ Your library is stored as `library.json` next to the config on macOS, or in `~/.
 
 `roms_dir` defaults to `~/retrodeck/roms`. If RetroDECK lives on an SD card, point it at the `roms` folder there.
 
+### archive.org login (restricted sets)
+
+Some archive.org sets are "restricted": only a logged-in account can download their files (e.g. the Redump Xbox 360 set `microsoft_xbox360_a_part1` … `_z`). Log in once:
+
+```sh
+romgetter archive-login you@example.com   # asks for the password (not echoed)
+romgetter archive-logout                  # forget the session
+```
+
+Or set `ARCHIVE_ORG_EMAIL` / `ARCHIVE_ORG_PASSWORD`. Only the session cookies are saved (`[archive_login]` in the config), not the password. While logged in, restricted sets show up in Search, and their games download directly from archive.org (`○ direct`), because TorBox can't log in for you.
+
 ## Tabs
 
 **1 Search**: type to find games. Results come from:
@@ -86,6 +98,7 @@ Your library is stored as `library.json` next to the config on macOS, or in `~/.
 - **live archive.org search**, run 0.7 s after you stop typing (or press Enter), for single-game uploads that aren't in any set. Phone, PC and modern-console uploads are filtered out.
 - **MAME 0.260 (non-merged)** for the `mame` system. MAME names its zips by short name (`sf2.zip`), so romgetter loads libretro's MAME list (short name → title, refreshed monthly) and search and the Library show and match full titles (`street fighter arcade`). Files keep their short names, which MAME needs. Games that need a CHD (hard disk or CD images, e.g. CPS3's Street Fighter III, which is only ~130 KB here) won't run from the zip alone.
 - **Vimm's Lair** (vimm.net/vault), a last resort, so **off by default**: turn it on from the Search tab's menu (Y, or `m`), which saves `use_vimm` in the config. It's searched live alongside archive.org; its results say "vimm.net (browser download)". Add "vimm" to a search to see only these. Vimm puts every download behind a human check, so romgetter can't fetch them. Enter on a Vimm game opens its page in a browser (Firefox or Chrome if installed, so it works from Game Mode; set `browser` to choose). Press Download there, and romgetter watches the downloads folder (`downloads_dir`, default `~/Downloads`). When a file matching the game's title finishes, romgetter moves it into `roms/<system>/`, unpacking a `.7z` (and dropping Vimm's `.txt` notice).
+- **The IF Archive** (ifarchive.org): free interactive fiction for RetroDECK's Gargoyle, about 2,300 story files. romgetter reads the archive's `Master-Index.xml` (indexed in the background, refreshed every 14 days) and keeps only files Gargoyle opens: Z-machine (`.z1`–`.z8`, `.zblorb`) go to `roms/zmachine/`; Glulx (`.ulx`, `.gblorb`, `.blb`), TADS (`.gam`, `.t3`), ADRIFT (`.taf`), Alan, AGT, Level 9, Magnetic Scrolls and JACL go to `roms/if/`. Zipped releases, web builds, source code and superseded versions (`old/`) are skipped. Each game shows the title and author from its description ("Photopia, by Adam Cadre  [photopia.z5]"), so you can search by author (`emily short`). `infocom`, `zcode` and `zmachine` filter to Z-machine games; `interactive fiction` or `text adventure` filter to the `if` system (a bare "if" stays an ordinary search word). These are free files, so they **never go through TorBox**: adding one downloads it straight away, and the Library shows `○ free` until it's on disk. Set `use_ifarchive = false` to leave them out. The classic Infocom games are still sold commercially and aren't on the archive.
 - any `extra_sets` from the config.
 
 A query matches the file name (region and version tags included), the set or upload title (e.g. "redump", "no-intro"), and the system:

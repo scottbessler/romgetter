@@ -1,6 +1,7 @@
 use crate::archive::{self, ItemHit, ItemIndex};
 use crate::config::Config;
 use crate::gamepad::{self, Pad};
+use crate::ifarchive;
 use crate::jobs::{self, LocalState, LocalTx};
 use crate::library::{self, Game, Library, SourceKind};
 use crate::minerva;
@@ -72,6 +73,8 @@ pub enum LibSort {
 #[derive(Debug, Clone)]
 pub enum Remote {
     NoKey,
+    /// Downloaded straight from its source, never through TorBox (IF Archive files).
+    Direct,
     NotSent,
     Sending,
     Pending {
@@ -476,6 +479,10 @@ impl App {
         if cfg.use_default_sets {
             sets.extend(sources::default_sets().into_iter().map(|(item, s)| SetRef { item, system: s.to_string() }));
         }
+        if cfg.use_ifarchive {
+            // per-file extensions pick zmachine; everything else is the "if" system
+            sets.push(SetRef { item: ifarchive::KEY.into(), system: "if".into() });
+        }
         for c in &cfg.extra_sets {
             if !sets.iter().any(|s| s.item == c.item) {
                 sets.push(SetRef { item: c.item.clone(), system: c.system.clone() });
@@ -560,6 +567,21 @@ impl App {
                 None => app.start_index(item),
             }
         }
+        // Games added from live search: their set's cached index says whether it's
+        // restricted (and so must be downloaded directly).
+        let extra: HashSet<String> = app
+            .lib
+            .games
+            .iter()
+            .filter_map(|g| archive::item_of_url(&g.source))
+            .filter(|i| !app.index.contains_key(*i))
+            .map(str::to_string)
+            .collect();
+        for item in extra {
+            if let Some(idx) = archive::load_cached(&app.cache_dir, &item) {
+                app.index.insert(item, idx);
+            }
+        }
 
         for group in minerva_stale {
             app.refresh_minerva(group);
@@ -588,6 +610,7 @@ impl App {
 
         for g in app.lib.games.iter().filter(|g| g.kind != SourceKind::Local) {
             let r = match (g.torbox_id, app.ctx.torbox.is_some()) {
+                _ if app.direct_only(&g.source) => Remote::Direct,
                 _ if g.rd_id.is_some() && app.ctx.rd.is_some() => Remote::Pending { state: "checking".into(), progress: 0.0 },
                 (_, false) => Remote::NoKey,
                 (Some(_), true) => Remote::Pending { state: "checking".into(), progress: 0.0 },
@@ -619,8 +642,16 @@ impl App {
         }
     }
 
+    /// How a library game shows: its own title (IF Archive) or `display_name`.
+    pub fn game_name(&self, g: &Game) -> String {
+        match &g.title {
+            Some(t) => format!("{t}  [{}]", g.name.rsplit('/').next().unwrap_or(&g.name)),
+            None => self.display_name(&g.system, &g.name),
+        }
+    }
+
     pub fn total_files(&self) -> usize {
-        self.sets.iter().filter_map(|s| self.index.get(&s.item)).filter(|i| !i.restricted).map(|i| i.files.len()).sum()
+        self.sets.iter().filter_map(|s| self.index.get(&s.item)).filter(|i| !self.hidden(i)).map(|i| i.files.len()).sum()
     }
 
     /// Still discovering or indexing sets.
@@ -822,7 +853,7 @@ impl App {
             .lib
             .games
             .iter()
-            .filter(|g| matches!(self.remote.get(&g.id), Some(Remote::Ready)))
+            .filter(|g| matches!(self.remote.get(&g.id), Some(Remote::Ready | Remote::Direct)))
             .filter(|g| !self.present.contains(&g.id) && !matches!(self.local.get(&g.id), Some(LocalState::Downloading { .. })))
             .filter(|g| !g.system.is_empty() && !self.download_queue.contains(&g.id))
             .map(|g| g.id.clone())
@@ -840,10 +871,13 @@ impl App {
         while self.local.values().filter(|s| matches!(s, LocalState::Downloading { .. })).count() < MAX_DOWNLOADS {
             let Some(id) = self.download_queue.pop_front() else { break };
             let Some(g) = self.lib.get(&id).cloned() else { continue };
-            if self.present.contains(&id) || !matches!(self.remote.get(&id), Some(Remote::Ready)) {
-                continue; // removed, already there, or no longer ready
-            }
-            self.start_local(g, true);
+            let direct = match self.remote.get(&id) {
+                _ if self.present.contains(&id) => continue, // already there
+                Some(Remote::Ready) => false,
+                Some(Remote::Direct) => true,
+                _ => continue, // removed, or no longer ready
+            };
+            self.start_local(g, !direct);
         }
     }
 
@@ -882,7 +916,7 @@ impl App {
         let mut longer: Vec<(HashSet<String>, Option<RomHit>)> = vec![(HashSet::new(), None); titles.len()];
         for s in &self.sets {
             let Some(idx) = self.index.get(&s.item) else { continue };
-            if idx.restricted {
+            if self.hidden(idx) {
                 continue;
             }
             let set_system = if s.system.is_empty() { idx.system.clone().unwrap_or_default() } else { s.system.clone() };
@@ -940,7 +974,13 @@ impl App {
         match &hit.torrent {
             Some((h, index)) => Game::torrent_file(hit.url.clone(), name, hit.system.clone(), minerva::magnet(h), *index, hit.size),
             None if vimm::is_vimm_url(&hit.url) => Game::new(hit.name.clone(), hit.system.clone(), SourceKind::Vimm, hit.url.clone(), 0),
-            None => Game::new(name, hit.system.clone(), SourceKind::Link, hit.url.clone(), hit.size),
+            None => {
+                let mut g = Game::new(name, hit.system.clone(), SourceKind::Link, hit.url.clone(), hit.size);
+                if ifarchive::is_url(&hit.url) {
+                    g.title.clone_from(&hit.title);
+                }
+                g
+            }
         }
     }
 
@@ -959,6 +999,7 @@ impl App {
             .games
             .iter()
             .filter(|g| !matches!(g.kind, SourceKind::Local | SourceKind::Vimm) && !self.present.contains(&g.id))
+            .filter(|g| !ifarchive::is_url(&g.source))
             .filter(|g| match self.remote.get(&g.id) {
                 Some(Remote::NotSent | Remote::Missing) | None => true,
                 Some(Remote::Error(_)) => self.retry_at.get(&g.id).is_none_or(|t| now >= *t),
@@ -1124,6 +1165,29 @@ impl App {
             .is_some_and(|i| i.files.iter().map(|f| f.size).sum::<u64>() <= UNCACHED_MAX)
     }
 
+    /// A readable TorBox name for a Minerva folder torrent ("Minerva - Redump - Sony -
+    /// PlayStation 3"); every one of them is otherwise just "Minerva_Myrient".
+    /// A restricted archive.org set we can't download from (not logged in).
+    fn hidden(&self, idx: &ItemIndex) -> bool {
+        idx.restricted && self.cfg.archive_login.is_none()
+    }
+
+    /// Downloaded straight from its source, never through TorBox: IF Archive files, and
+    /// restricted archive.org sets (only a logged-in account can fetch them).
+    pub fn direct_only(&self, source: &str) -> bool {
+        ifarchive::is_url(source)
+            || self.cfg.archive_login.is_some()
+                && archive::item_of_url(source).and_then(|i| self.index.get(i)).is_some_and(|x| x.restricted)
+    }
+
+    fn minerva_name(&self, btih: &str) -> Option<String> {
+        self.index
+            .values()
+            .find(|i| i.btih.as_deref().is_some_and(|h| h.eq_ignore_ascii_case(btih)))
+            .filter(|i| !i.title.is_empty())
+            .map(|i| i.title.replace(" · ", " - "))
+    }
+
     fn start_index(&mut self, item: String) {
         if !self.indexing.insert(item.clone()) {
             return;
@@ -1135,6 +1199,7 @@ impl App {
             let _permit = permits.acquire_owned().await;
             let res = match minerva::parse_key(&item) {
                 Some((group, folder)) => minerva::fetch_folder(&http, group, folder).await,
+                None if item == ifarchive::KEY => ifarchive::fetch_index(&http).await,
                 None => archive::fetch_index(&http, &item).await,
             };
             let _ = tx.send(Msg::Indexed(item, res));
@@ -1163,6 +1228,7 @@ impl App {
         let generation = self.live_gen;
         let http = self.ctx.http.clone();
         let tx = self.tx.clone();
+        let restricted_ok = self.cfg.archive_login.is_some();
         // "vimm" in the query only narrows results to Vimm; the sites don't get it.
         let q: String = q.split_whitespace().filter(|w| !w.eq_ignore_ascii_case("vimm")).collect::<Vec<_>>().join(" ");
         if self.cfg.use_vimm && !q.is_empty() {
@@ -1172,11 +1238,15 @@ impl App {
             });
         }
         tokio::spawn(async move {
-            let _ = tx.send(Msg::Live(generation, archive::search_games(&http, &q).await));
+            let _ = tx.send(Msg::Live(generation, archive::search_games(&http, &q, restricted_ok).await));
         });
     }
 
     fn send_to_torbox(&mut self, id: &str) {
+        if self.lib.get(id).is_some_and(|g| self.direct_only(&g.source)) {
+            self.remote.insert(id.to_string(), Remote::Direct);
+            return;
+        }
         if self.lib.get(id).is_some_and(|g| self.uses_rd(g)) {
             self.send_to_rd(id);
             return;
@@ -1223,8 +1293,9 @@ impl App {
         let tx = self.tx.clone();
         // Never start a multi-TB download for one game: big Minerva torrents must be cached.
         let only_cached = g.pick.is_some() && !hash.as_deref().is_some_and(|h| self.minerva_small(h));
+        let torrent_name = hash.as_deref().and_then(|h| self.minerva_name(h));
         tokio::spawn(async move {
-            let name = (g.kind == SourceKind::Link).then_some(g.name.as_str());
+            let name = if g.kind == SourceKind::Link { Some(g.name.as_str()) } else { torrent_name.as_deref() };
             let res = match tb.create(g.torbox_kind(), &g.source, name, only_cached).await {
                 Ok(id) => Ok(id),
                 Err(e) => match &hash {
@@ -1401,7 +1472,7 @@ impl App {
                     Err(e) => self.status = format!("checking TorBox's cache failed: {e:#}"),
                 }
             }
-            Msg::MinervaFolders(group, res) => {
+                        Msg::MinervaFolders(group, res) => {
                 self.minerva_pending = self.minerva_pending.saturating_sub(1);
                 match res {
                     Ok(folders) => {
@@ -1427,6 +1498,11 @@ impl App {
                 self.live_loading = false;
                 match res {
                     Ok(items) => {
+                        // Remember restricted sets, so their games download directly.
+                        for (h, idx) in items.iter().filter(|(_, i)| i.restricted) {
+                            let _ = archive::save_cached(&self.cache_dir, &h.identifier, idx);
+                            self.index.entry(h.identifier.clone()).or_insert_with(|| idx.clone());
+                        }
                         self.live_hits = self.live_to_hits(items);
                         self.merge_hits();
                     }
@@ -1623,7 +1699,7 @@ impl App {
                 let title = if crate::mame::is_mame_system(system) {
                     crate::mame::short_name(&f.name).and_then(|n| self.mame_titles.get(&n).cloned())
                 } else {
-                    None
+                    f.title.clone()
                 };
                 let mut text = f.name.to_lowercase();
                 if let Some(t) = &title {
@@ -1644,7 +1720,7 @@ impl App {
                 return;
             }
             let item = &self.sets[i].item;
-            if self.hay.contains_key(item) || self.index.get(item).is_none_or(|x| x.restricted) {
+            if self.hay.contains_key(item) || self.index.get(item).is_none_or(|x| self.hidden(x)) {
                 continue;
             }
             let h = self.build_hay(&self.sets[i], &self.index[item]);
@@ -1659,7 +1735,7 @@ impl App {
             self.build_hays(None);
             'outer: for s in &self.sets {
                 let Some(idx) = self.index.get(&s.item) else { continue };
-                if idx.restricted {
+                if self.hidden(idx) {
                     continue;
                 }
                 let Some(hay) = self.hay.get(&s.item) else { continue };
@@ -1808,6 +1884,19 @@ impl App {
             self.lib_cursor = Some(RowKey::Game(id));
             return;
         }
+        if self.direct_only(&game.source) {
+            // IF Archive (free and small) or a restricted archive.org set TorBox can't
+            // fetch: no TorBox round trip, just download it.
+            let from = if ifarchive::is_url(&game.source) { "the IF Archive" } else { "archive.org" };
+            self.status = format!("added {}, downloading from {from}…", self.game_name(&game));
+            self.collapsed.remove(&game.system);
+            self.remote.insert(id.clone(), Remote::Direct);
+            self.lib.games.push(game.clone());
+            self.save_lib();
+            self.lib_cursor = Some(RowKey::Game(id));
+            self.start_local(game, false);
+            return;
+        }
         self.status = format!(
             "added {} to library{}",
             game.name,
@@ -1858,7 +1947,7 @@ impl App {
         let mut idx: Vec<usize> = (0..self.lib.games.len())
             .filter(|&i| {
                 let g = &self.lib.games[i];
-                matches_all(&format!("{} {}", g.name, g.system), &terms)
+                matches_all(&format!("{} {} {}", g.name, g.title.as_deref().unwrap_or(""), g.system), &terms)
             })
             .collect();
         let order = |s: &str| systems::SYSTEMS.iter().position(|(f, _)| *f == s).unwrap_or(usize::MAX);
@@ -2056,6 +2145,10 @@ impl App {
                 self.retry_at.remove(&g.id);
                 self.send_to_torbox(&g.id);
             }
+            Remote::Direct => {
+                self.status = format!("downloading {}…", self.game_name(&g));
+                self.start_local(g, false);
+            }
             Remote::NoKey => {
                 if g.kind == SourceKind::Link && !g.system.is_empty() {
                     self.status = format!("no TorBox key; downloading {} directly…", g.name);
@@ -2224,7 +2317,7 @@ impl App {
                     self.pad = false;
                     self.pad_typing = false;
                 }
-                self.on_key(k)
+                self.on_key(k);
             }
             Event::Paste(s) if self.editing => {
                 self.current_input().push_str(s.trim_end_matches(['\n', '\r']));
@@ -2677,7 +2770,8 @@ mod tests {
         static N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
         let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let dir = std::env::temp_dir().join(format!("romgetter-app-{}-{n}", std::process::id()));
-        let cfg = Config { use_minerva: false, use_default_sets: false, roms_dir: dir.join("roms"), ..Config::default() };
+        let cfg =
+            Config { use_minerva: false, use_default_sets: false, use_ifarchive: false, roms_dir: dir.join("roms"), ..Config::default() };
         let mut lib = Library::load(dir.join("library.json")).unwrap();
         lib.games = games;
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
@@ -2718,7 +2812,7 @@ mod tests {
     async fn hides_minerva_files_torbox_lacks() {
         let mut app = test_app(Vec::new());
         let h = "626a5e05f498e435145c97352aa2fecf7e95a668".to_string();
-        let file = |n: &str| archive::RomFile { name: n.into(), size: 14 << 30, url: None, torrent_index: Some(1) };
+        let file = |n: &str| archive::RomFile { name: n.into(), size: 14 << 30, url: None, torrent_index: Some(1), title: None };
         app.sets.push(SetRef { item: minerva::set_key("Redump", "Sony - PlayStation 3"), system: "ps3".into() });
         app.index.insert(
             minerva::set_key("Redump", "Sony - PlayStation 3"),
@@ -2762,6 +2856,7 @@ mod tests {
                     size: 40 << 40,
                     url: None,
                     torrent_index: Some(171),
+                    title: None,
                 }],
                 system: Some("ps3".into()),
                 title: "Minerva · Redump · Sony - PlayStation 3".into(),
@@ -2784,7 +2879,7 @@ mod tests {
     #[tokio::test]
     async fn top_list_matching() {
         let mut app = test_app(Vec::new());
-        let file = |n: &str| archive::RomFile { name: n.into(), size: 1, url: None, torrent_index: None };
+        let file = |n: &str| archive::RomFile { name: n.into(), size: 1, url: None, torrent_index: None, title: None };
         app.sets.push(SetRef { item: "x360".into(), system: "xbox360".into() });
         app.index.insert(
             "x360".into(),
@@ -2814,6 +2909,26 @@ mod tests {
         assert_eq!(got[2], None, "betas don't count");
         assert_eq!(got[3].as_deref(), Some("Fable II (USA).iso"));
         assert_eq!(got[4], None, "two different subtitled games: ambiguous");
+    }
+
+    #[tokio::test]
+    async fn if_archive_games_skip_torbox() {
+        let url = "https://ifarchive.org/if-archive/games/zcode/photopia.z5";
+        let mut g = Game::new("photopia.z5".into(), "zmachine".into(), SourceKind::Link, url.into(), 239616);
+        g.title = Some("Photopia, by Adam Cadre".into());
+        let mut app = test_app(vec![g]);
+        assert!(matches!(app.remote.get(url), Some(Remote::Direct)));
+        app.ctx.torbox = Some(crate::torbox::TorBox::new(reqwest::Client::new(), "k".into()));
+        app.remote.insert(url.into(), Remote::NotSent);
+        app.auto_send();
+        assert!(matches!(app.remote.get(url), Some(Remote::NotSent)), "auto_send must leave it alone");
+        app.send_to_torbox(url);
+        assert!(matches!(app.remote.get(url), Some(Remote::Direct)));
+        let g = app.lib.get(url).unwrap();
+        assert_eq!(app.game_name(g), "Photopia, by Adam Cadre  [photopia.z5]");
+        // the Library filter finds it by title
+        app.lib_filter = "cadre".into();
+        assert_eq!(app.lib_rows().len(), 2); // header + game
     }
 
     #[tokio::test]
@@ -2957,6 +3072,7 @@ mod tests {
                     size: 14 << 30,
                     url: None,
                     torrent_index: Some(1),
+                    title: None,
                 }],
                 system: Some("ps3".into()),
                 title: "Minerva · Redump · Sony - PlayStation 3".into(),

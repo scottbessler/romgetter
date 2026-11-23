@@ -227,6 +227,13 @@ fn game_status(app: &App, id: &str) -> (String, Color, String) {
         Some(Remote::Missing) => ("! gone".into(), Color::Red, "no longer on TorBox · Enter re-sends".into()),
         Some(Remote::Error(m)) => ("✗ torbox".into(), Color::Red, m.clone()),
         Some(Remote::NoKey) => ("○ local".into(), Color::DarkGray, "no TorBox key · Enter downloads directly".into()),
+        Some(Remote::Direct) => {
+            if app.lib.get(id).is_some_and(|g| crate::ifarchive::is_url(&g.source)) {
+                ("○ free".into(), Color::DarkGray, "IF Archive · Enter downloads it".into())
+            } else {
+                ("○ direct".into(), Color::DarkGray, "restricted on archive.org (TorBox can't fetch it) · Enter downloads it with your login".into())
+            }
+        }
         Some(Remote::NotSent) | None => ("○ not sent".into(), Color::DarkGray, "Enter sends to TorBox".into()),
     }
 }
@@ -289,11 +296,8 @@ fn draw_library(f: &mut Frame, app: &mut App, area: Rect) {
             Row::Game(i) => {
                 let g = &app.lib.games[*i];
                 let (badge, color, detail) = game_status(app, &g.id);
-                let mut spans = vec![
-                    Span::raw("  "),
-                    Span::styled(format!("{badge:<11}"), Style::new().fg(color).bold()),
-                    Span::raw(app.display_name(&g.system, &g.name)),
-                ];
+                let mut spans =
+                    vec![Span::raw("  "), Span::styled(format!("{badge:<11}"), Style::new().fg(color).bold()), Span::raw(app.game_name(g))];
                 // on disk: what it really takes; not yet: the source's size, dimmed
                 match app.size_on_disk(g) {
                     0 if g.size > 0 => spans.push(Span::styled(format!("  {}", human(g.size)), DIM)),
@@ -392,7 +396,7 @@ fn draw_textures(f: &mut Frame, app: &mut App, area: Rect) {
             ])),
             TexRow::Game(g) => {
                 let g = &app.lib.games[*g];
-                ListItem::new(Line::from(vec![Span::raw("  "), Span::styled(app.display_name(&g.system, &g.name), Style::new().bold())]))
+                ListItem::new(Line::from(vec![Span::raw("  "), Span::styled(app.game_name(g), Style::new().bold())]))
             }
             TexRow::Pack(_, p) => {
                 let Some(p) = app.tex.pack(*p) else { return ListItem::new("") };

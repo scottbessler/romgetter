@@ -48,6 +48,9 @@ pub struct Game {
     pub torrent_index: Option<u32>,
     #[serde(default)]
     pub added: u64,
+    /// A readable title when the file name isn't one (IF Archive games).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
 }
 
 impl Game {
@@ -66,6 +69,7 @@ impl Game {
             pick: None,
             torrent_index: None,
             added,
+            title: None,
         }
     }
 

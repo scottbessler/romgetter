@@ -7,13 +7,24 @@ pub fn default_sets() -> Vec<(String, &'static str)> {
     for (fmt, sys, parts) in MULTI_PART_SETS {
         out.extend((1..=*parts).map(|n| (fmt.replace("{n}", &n.to_string()), *sys)));
     }
+    out.extend(XBOX360_REDUMP.iter().map(|s| (format!("microsoft_xbox360_{s}"), "xbox360")));
     out
 }
+
+/// Redump Xbox 360 split by first letter (`microsoft_xbox360_<suffix>`, ~30 TB). These
+/// are restricted: they only show up after `romgetter archive-login`.
+const XBOX360_REDUMP: &[&str] = &[
+    "numberssymbols", "a_part1", "a_part2", "b_part1", "b_part2", "c_part1", "c_part2", "d_part1", "d_part2", "d_part3", "e",
+    "f_part1", "f_part2", "g", "h", "i", "j", "k", "l", "m_part1", "m_part2", "n_part1", "n_part2", "o", "p", "q", "r",
+    "r_part1", "s_part1", "s_part2", "t_part1", "t_part2", "u", "v", "w", "x_part1", "x_part2", "y", "z",
+];
 
 /// (identifier with `{n}` for the part number, system, number of parts)
 const MULTI_PART_SETS: &[(&str, &str, u32)] = &[
     ("PS3-Redump-2024-Individual-Games-Part{n}", "ps3", 34),
     ("Wii-Redump-2024-Individual-Games-Part{n}", "wii", 6),
+    // full Redump PS2 set, all regions (parts 1 and 8 restricted as of 2026-11)
+    ("PS2-Redump-2024-Individual-Games-Part{n}", "ps2", 17),
     ("ef_Sony_PlayStation1_Redump_Collection_{n}of4", "psx", 4),
     ("ef_sony_psp_part_{n}of3", "psp", 3),
     // plain ISOs, titles # through C

@@ -34,6 +34,9 @@ pub struct Config {
     /// Search the built-in No-Intro/Redump sets (see sources.rs).
     #[serde(default = "yes")]
     pub use_default_sets: bool,
+    /// Search the IF Archive's free interactive fiction (played with Gargoyle).
+    #[serde(default = "yes")]
+    pub use_ifarchive: bool,
     /// Search Vimm's Lair (downloaded through a browser). A last resort, so off by
     /// default; the Search tab's menu toggles it.
     #[serde(default)]
@@ -48,6 +51,19 @@ pub struct Config {
     /// Extra archive.org sets to index for Search, on top of the built-in ones.
     #[serde(default, alias = "collections")]
     pub extra_sets: Vec<Collection>,
+    /// archive.org session from `romgetter archive-login` (the password isn't kept).
+    /// Unlocks "restricted" sets, which then download directly instead of via TorBox.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub archive_login: Option<ArchiveLogin>,
+}
+
+/// archive.org's login cookies.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ArchiveLogin {
+    /// `logged-in-user` (the account's email).
+    pub user: String,
+    /// `logged-in-sig`.
+    pub sig: String,
 }
 
 fn yes() -> bool {
@@ -71,10 +87,12 @@ impl Default for Config {
             poll_secs: default_poll(),
             use_minerva: true,
             use_default_sets: true,
+            use_ifarchive: true,
             use_vimm: false,
             browser: None,
             downloads_dir: None,
             extra_sets: Vec::new(),
+            archive_login: None,
         }
     }
 }

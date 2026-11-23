@@ -174,10 +174,23 @@ impl TorBox {
             form = form.text("name", n.to_string());
         }
         let data = self.call(self.http.post(format!("{BASE}/{}/{endpoint}", kind.path())).bearer_auth(&self.key).multipart(form)).await?;
-        ["webdownload_id", "torrent_id", "id"]
+        let id = ["webdownload_id", "torrent_id", "id"]
             .iter()
             .find_map(|k| data.get(k).and_then(as_u64))
-            .ok_or_else(|| anyhow!("TorBox create: no id in response: {data}"))
+            .ok_or_else(|| anyhow!("TorBox create: no id in response: {data}"))?;
+        // TorBox ignores `name` for torrents and uses the torrent's own name (every Minerva
+        // torrent is "Minerva_Myrient"); renaming afterwards sticks. Cosmetic: errors ignored.
+        if kind == Kind::Torrent
+            && let Some(n) = name
+        {
+            let _ = self.rename_torrent(id, n).await;
+        }
+        Ok(id)
+    }
+
+    pub async fn rename_torrent(&self, id: u64, name: &str) -> Result<()> {
+        let body = serde_json::json!({ "torrent_id": id, "name": name });
+        self.call(self.http.put(format!("{BASE}/torrents/edittorrent")).bearer_auth(&self.key).json(&body)).await.map(drop)
     }
 
     pub async fn get(&self, kind: Kind, id: u64) -> Result<Item> {

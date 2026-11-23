@@ -72,6 +72,8 @@ pub const SYSTEMS: &[(&str, &str)] = &[
     ("x68000", "Sharp - X68000"),
     ("c64", "Commodore - 64"),
     ("amiga", "Commodore - Amiga"),
+    ("zmachine", "Interactive Fiction - Z-machine"),
+    ("if", "Interactive Fiction"),
     ("mame", "Arcade - MAME"),
     ("arcade", "Arcade"),
 ];
@@ -196,6 +198,12 @@ const TITLE_PATTERNS: &[(&str, &str)] = &[
     ("commodore 64", "c64"),
     ("c64", "c64"),
     ("amiga", "amiga"),
+    ("z machine", "zmachine"),
+    ("zmachine", "zmachine"),
+    ("zcode", "zmachine"),
+    ("infocom", "zmachine"),
+    ("interactive fiction", "if"),
+    ("text adventure", "if"),
     ("finalburn", "arcade"),
     ("fbneo", "arcade"),
     ("mame", "mame"),
@@ -278,6 +286,24 @@ const EXTENSIONS: &[(&str, &str)] = &[
     ("cdt", "amstradcpc"),
     ("dsk", "amstradcpc"),
     ("dim", "x68000"),
+    // interactive fiction story files (Gargoyle). "z80" above is a Spectrum snapshot.
+    ("z1", "zmachine"),
+    ("z2", "zmachine"),
+    ("z3", "zmachine"),
+    ("z4", "zmachine"),
+    ("z5", "zmachine"),
+    ("z6", "zmachine"),
+    ("z7", "zmachine"),
+    ("z8", "zmachine"),
+    ("zblorb", "zmachine"),
+    ("zlb", "zmachine"),
+    ("ulx", "if"),
+    ("gblorb", "if"),
+    ("glb", "if"),
+    ("blb", "if"),
+    ("t3", "if"),
+    ("taf", "if"),
+    ("a3c", "if"),
 ];
 
 /// Lowercase, turn every non-alphanumeric into a single space, and pad with spaces so
@@ -379,9 +405,10 @@ pub fn alias(phrase: &str) -> Option<&'static str> {
     if p.is_empty() {
         return None;
     }
+    // "if" is an ordinary word in titles ("What If"): only "interactive fiction" names it.
     SYSTEMS
         .iter()
-        .find(|(f, l)| normalize_one(f, false).trim() == p || normalize_one(l, false).trim() == p)
+        .find(|(f, l)| (*f != "if" && normalize_one(f, false).trim() == p) || normalize_one(l, false).trim() == p)
         .map(|(f, _)| *f)
         .or_else(|| TITLE_PATTERNS.iter().find(|(pat, _)| *pat == p).map(|(_, s)| *s))
 }
@@ -631,6 +658,15 @@ mod tests {
         assert_eq!(q.systems, [] as [(String, &str); 0]);
         assert_eq!(Query::parse("ps1 crash").systems[0].1, "psx");
         assert_eq!(Query::parse("n3ds").systems[0].1, "n3ds");
+        // interactive fiction: "zork infocom" filters, but "if" stays a plain word
+        assert_eq!(Query::parse("zork infocom").systems[0].1, "zmachine");
+        assert_eq!(Query::parse("photopia interactive fiction").systems[0].1, "if");
+        let q = Query::parse("what if");
+        assert_eq!(q.text, vec!["what", "if"]);
+        assert_eq!(q.systems, [] as [(String, &str); 0]);
+        assert_eq!(guess_from_filename("photopia.z5"), Some("zmachine"));
+        assert_eq!(guess_from_filename("Counterfeit Monkey.gblorb"), Some("if"));
+        assert_eq!(guess_from_filename("Manic Miner.z80"), Some("zxspectrum"));
     }
 
     #[test]

@@ -26,6 +26,9 @@ pub struct RomFile {
     /// For torrent-backed indexes (Minerva): this file's index inside the torrent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub torrent_index: Option<u32>,
+    /// A readable title when the file name isn't one (IF Archive: "Photopia, by Adam Cadre").
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
 }
 
 impl RomFile {
@@ -57,7 +60,13 @@ fn parse_archive_listing(html: &str, item: &str, archive: &str) -> Vec<RomFile> 
             continue;
         }
         let size = rest.split_once("id=\"size\">").and_then(|(_, s)| s.split('<').next()).and_then(|s| s.trim().parse().ok()).unwrap_or(0);
-        out.push(RomFile { name: format!("{archive}/{member}"), size, url: Some(format!("https:{href}")), torrent_index: None });
+        out.push(RomFile {
+            name: format!("{archive}/{member}"),
+            size,
+            url: Some(format!("https:{href}")),
+            torrent_index: None,
+            title: None,
+        });
     }
     out
 }
@@ -243,6 +252,7 @@ async fn fetch_index_opts(http: &reqwest::Client, item: &str, deep: bool) -> Res
             size: num(f.get("size")),
             url: None,
             torrent_index: None,
+            title: None,
         })
         .collect();
     let may_expand = deep && roms.len() <= EXPAND_ONLY_IF_FILES_AT_MOST;
@@ -283,7 +293,8 @@ const LIVE_MAX_ITEMS: usize = 25;
 /// Good for single-game uploads that aren't part of any big set. archive.org's relevance
 /// order is noisy (phone/PC/modern-console uploads), so items whose title names a
 /// supported system go first and unsupported platforms are dropped.
-pub async fn search_games(http: &reqwest::Client, query: &str) -> Result<Vec<(ItemHit, ItemIndex)>> {
+/// `restricted_ok`: logged in to archive.org, so restricted items can be downloaded.
+pub async fn search_games(http: &reqwest::Client, query: &str, restricted_ok: bool) -> Result<Vec<(ItemHit, ItemIndex)>> {
     use futures_util::StreamExt;
     let hits = search_items(http, query, 100, false).await?;
     let (mut known, unknown): (Vec<ItemHit>, Vec<ItemHit>) = hits
@@ -295,7 +306,7 @@ pub async fn search_games(http: &reqwest::Client, query: &str) -> Result<Vec<(It
     let results: Vec<(ItemHit, ItemIndex)> = futures_util::stream::iter(known)
         .map(|h| async move {
             let idx = fetch_index_opts(http, &h.identifier, false).await.ok()?;
-            let usable = !idx.restricted && !idx.files.is_empty() && idx.files.len() <= LIVE_MAX_FILES;
+            let usable = (restricted_ok || !idx.restricted) && !idx.files.is_empty() && idx.files.len() <= LIVE_MAX_FILES;
             // Keep it only if we can tell what it's for.
             let identifiable = idx.system.is_some() || idx.files.iter().any(|f| systems::guess_from_filename(&f.name).is_some());
             (usable && identifiable).then_some((h, idx))
@@ -305,6 +316,47 @@ pub async fn search_games(http: &reqwest::Client, query: &str) -> Result<Vec<(It
         .collect()
         .await;
     Ok(results)
+}
+
+/// The item a `https://archive.org/download/ITEM/...` URL belongs to.
+pub fn item_of_url(url: &str) -> Option<&str> {
+    let rest = url.split_once("archive.org/download/")?.1;
+    rest.split('/').next().filter(|s| !s.is_empty())
+}
+
+/// Log in to archive.org (the same endpoint the `ia` tool uses) and return its session
+/// cookies. Restricted items only serve files to a logged-in account.
+pub async fn login(email: &str, password: &str) -> Result<crate::config::ArchiveLogin> {
+    let http = reqwest::Client::builder().user_agent(concat!("romgetter/", env!("CARGO_PKG_VERSION"))).build()?;
+    let resp: Value = http
+        .post("https://archive.org/services/xauthn/")
+        .query(&[("op", "login")])
+        .form(&[("email", email), ("password", password)])
+        .send()
+        .await?
+        .json()
+        .await
+        .context("archive.org login: unexpected response")?;
+    if resp["success"] != Value::Bool(true) {
+        let why = resp["values"]["reason"].as_str().or_else(|| resp["error"].as_str()).unwrap_or("rejected");
+        anyhow::bail!("archive.org login failed: {why}");
+    }
+    let cookies = &resp["values"]["cookies"];
+    let get = |k: &str| cookies[k].as_str().map(str::to_string).with_context(|| format!("archive.org login: no {k} cookie"));
+    Ok(crate::config::ArchiveLogin { user: get("logged-in-user")?, sig: get("logged-in-sig")? })
+}
+
+/// A cookie jar holding the archive.org session, for the shared HTTP client. Scoped to
+/// .archive.org, so the download servers it redirects to (ia800….us.archive.org) get it
+/// too, and nothing else does.
+pub fn cookie_jar(login: &crate::config::ArchiveLogin) -> std::sync::Arc<reqwest::cookie::Jar> {
+    let jar = reqwest::cookie::Jar::default();
+    let url: reqwest::Url = "https://archive.org/".parse().expect("static url");
+    let enc = |v: &str| if v.contains('@') { urlencoding::encode(v).into_owned() } else { v.to_string() };
+    for (k, v) in [("logged-in-user", enc(&login.user)), ("logged-in-sig", enc(&login.sig))] {
+        jar.add_cookie_str(&format!("{k}={v}; Domain=.archive.org; Path=/; Secure"), &url);
+    }
+    std::sync::Arc::new(jar)
 }
 
 pub fn download_url(item: &str, file: &str) -> String {
@@ -334,6 +386,25 @@ mod tests {
     use super::*;
 
     #[test]
+    fn items_of_urls() {
+        assert_eq!(item_of_url("https://archive.org/download/microsoft_xbox360_a_part1/ABC%20Wipeout%202%20(USA).zip"), Some("microsoft_xbox360_a_part1"));
+        assert_eq!(item_of_url(&download_url("x", "a/b.zip")), Some("x"));
+        assert_eq!(item_of_url("https://ifarchive.org/if-archive/games/zcode/x.z5"), None);
+        assert_eq!(item_of_url("minerva:abc/x.zip"), None);
+    }
+
+    #[test]
+    fn jar_covers_download_servers() {
+        use reqwest::cookie::CookieStore;
+        let jar = cookie_jar(&crate::config::ArchiveLogin { user: "me@example.com".into(), sig: "s1g".into() });
+        let on = |u: &str| jar.cookies(&u.parse().unwrap()).map(|h| h.to_str().unwrap().to_string());
+        let c = on("https://ia800300.us.archive.org/1/items/x/y.zip").unwrap();
+        assert!(c.contains("logged-in-user=me%40example.com") && c.contains("logged-in-sig=s1g"), "{c}");
+        assert!(on("https://archive.org/download/x/y.zip").is_some());
+        assert!(on("https://api.torbox.app/v1/api").is_none());
+    }
+
+    #[test]
     fn url_encodes_segments() {
         assert_eq!(
             download_url("nointro.snes", "Sub Dir/Super Mario World (USA).zip"),
@@ -350,7 +421,7 @@ mod tests {
         assert!(!hits.is_empty());
 
         // Live game search finds single-game uploads, without junk like iOS .ipa files.
-        let games = search_games(&http, "super monkey ball").await.unwrap();
+        let games = search_games(&http, "super monkey ball", false).await.unwrap();
         let all: Vec<&str> = games.iter().flat_map(|(_, i)| i.files.iter().map(|f| f.name.as_str())).collect();
         assert!(all.iter().any(|n| has_ext(n, "iso")), "{all:?}");
         assert!(!all.iter().any(|n| has_ext(n, "ipa")), "{all:?}");

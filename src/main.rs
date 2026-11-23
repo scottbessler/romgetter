@@ -2,6 +2,7 @@ mod app;
 mod archive;
 mod config;
 mod gamepad;
+mod ifarchive;
 mod jobs;
 mod library;
 mod mame;
@@ -26,13 +27,42 @@ use std::time::Duration;
 #[tokio::main]
 async fn main() -> Result<()> {
     let paths = config::Paths::new()?;
-    let cfg = config::Config::load(&paths.config_file)?;
+    let mut cfg = config::Config::load(&paths.config_file)?;
     let lib = library::Library::load(paths.library_file.clone())?;
 
-    let http = reqwest::Client::builder()
+    // `romgetter archive-login [email]` / `archive-logout`: keep an archive.org session so
+    // restricted sets can be searched and downloaded (directly; TorBox can't log in).
+    match std::env::args().nth(1).as_deref() {
+        Some("archive-login") => {
+            let email = match std::env::args().nth(2).or_else(|| std::env::var("ARCHIVE_ORG_EMAIL").ok()) {
+                Some(e) => e,
+                None => prompt("archive.org email: ", false)?,
+            };
+            let password = match std::env::var("ARCHIVE_ORG_PASSWORD") {
+                Ok(p) if !p.is_empty() => p,
+                _ => prompt("archive.org password: ", true)?,
+            };
+            cfg.archive_login = Some(archive::login(email.trim(), &password).await?);
+            cfg.save(&paths.config_file)?;
+            println!("logged in to archive.org; restricted sets now show up in Search and download directly");
+            return Ok(());
+        }
+        Some("archive-logout") => {
+            cfg.archive_login = None;
+            cfg.save(&paths.config_file)?;
+            println!("archive.org session removed");
+            return Ok(());
+        }
+        _ => {}
+    }
+
+    let mut builder = reqwest::Client::builder()
         .user_agent(concat!("romgetter/", env!("CARGO_PKG_VERSION")))
-        .connect_timeout(Duration::from_secs(20))
-        .build()?;
+        .connect_timeout(Duration::from_secs(20));
+    if let Some(login) = &cfg.archive_login {
+        builder = builder.cookie_provider(archive::cookie_jar(login));
+    }
+    let http = builder.build()?;
     let ctx = jobs::Ctx {
         torbox: cfg.api_key().map(|k| torbox::TorBox::new(http.clone(), k)),
         rd: cfg.rd_key().map(|k| realdebrid::RealDebrid::new(http.clone(), k)),
@@ -225,4 +255,41 @@ async fn main() -> Result<()> {
     res?;
     eprintln!("config: {}\nlibrary: {}", paths.config_file.display(), paths.library_file.display());
     Ok(())
+}
+
+/// Read a line from the terminal; `hidden` doesn't echo it (for passwords).
+fn prompt(label: &str, hidden: bool) -> Result<String> {
+    use ratatui::crossterm::event::{Event, KeyCode, KeyEventKind, KeyModifiers};
+    use ratatui::crossterm::terminal;
+    use std::io::Write;
+    print!("{label}");
+    std::io::stdout().flush()?;
+    if !hidden {
+        let mut line = String::new();
+        std::io::stdin().read_line(&mut line)?;
+        return Ok(line.trim_end_matches(['\r', '\n']).to_string());
+    }
+    terminal::enable_raw_mode()?;
+    let res = (|| {
+        let mut s = String::new();
+        loop {
+            if let Event::Key(k) = event::read()?
+                && k.kind != KeyEventKind::Release
+            {
+                match k.code {
+                    KeyCode::Enter => return Ok(s),
+                    KeyCode::Char('c') if k.modifiers.contains(KeyModifiers::CONTROL) => anyhow::bail!("cancelled"),
+                    KeyCode::Char(c) => s.push(c),
+                    KeyCode::Backspace => {
+                        s.pop();
+                    }
+                    KeyCode::Esc => anyhow::bail!("cancelled"),
+                    _ => {}
+                }
+            }
+        }
+    })();
+    terminal::disable_raw_mode()?;
+    println!();
+    res
 }
