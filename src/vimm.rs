@@ -339,7 +339,7 @@ fn copy_with_progress(r: &mut dyn std::io::Read, w: &mut dyn std::io::Write, tot
 
 /// Extract every file of a .7z into `dir`, flattened to base names (Vimm's archives hold a
 /// game's files at the top level). Returns the file names.
-fn extract_7z(src: &Path, dir: &Path, progress: &dyn Fn(u64, u64)) -> Result<Vec<String>> {
+pub fn extract_7z(src: &Path, dir: &Path, progress: &dyn Fn(u64, u64)) -> Result<Vec<String>> {
     let mut names = Vec::new();
     let mut unpacked = 0u64;
     let mut err = None;

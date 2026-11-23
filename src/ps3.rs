@@ -137,6 +137,10 @@ fn is_iso(rel: &str) -> bool {
 pub async fn finish(files: Vec<String>, ctx: &Ctx, send: &impl Fn(LocalState)) -> Result<Vec<String>> {
     let mut out = Vec::new();
     for rel in files {
+        if is_unpack_7z(&rel) {
+            out.extend(unpack_7z(&rel, ctx, send).await?);
+            continue;
+        }
         if is_unzip_all(&rel, &ctx.roms_dir) {
             out.extend(unpack_all(&rel, ctx, send).await?);
             continue;
@@ -195,6 +199,35 @@ async fn unpack(rel: &str, ctx: &Ctx, send: &impl Fn(LocalState)) -> Result<Stri
 
 /// Unzip every file of a downloaded zip into its folder (flat), then delete the zip.
 /// Returns the extracted files relative to roms_dir.
+/// A .7z game (the 1G1R Redump sets pack each game as one): few emulators read 7z, so
+/// it's unpacked in place. MAME romsets stay packed.
+fn is_unpack_7z(rel: &str) -> bool {
+    crate::library::has_ext(rel, "7z") && !rel.split('/').next().is_some_and(crate::mame::is_mame_system)
+}
+
+/// Unpack a .7z next to itself and delete it. Returns the unpacked files relative to roms_dir.
+async fn unpack_7z(rel: &str, ctx: &Ctx, send: &impl Fn(LocalState)) -> Result<Vec<String>> {
+    let path = ctx.roms_dir.join(rel);
+    let dir_rel = rel.rsplit_once('/').map(|(d, _)| d.to_string()).unwrap_or_default();
+    let label = format!("unpacking {}", rel.rsplit('/').next().unwrap_or(rel));
+    let done = Arc::new(AtomicU64::new(0));
+    let task = {
+        let (path, dir, done) = (path.clone(), ctx.roms_dir.join(&dir_rel), done.clone());
+        tokio::task::spawn_blocking(move || crate::vimm::extract_7z(&path, &dir, &|d, _| done.store(d, Ordering::Relaxed)))
+    };
+    tokio::pin!(task);
+    let names = loop {
+        tokio::select! {
+            res = &mut task => break res??,
+            () = tokio::time::sleep(Duration::from_millis(250)) => {
+                send(LocalState::Downloading { file: label.clone(), done: done.load(Ordering::Relaxed), total: 0 });
+            }
+        }
+    };
+    tokio::fs::remove_file(&path).await.with_context(|| format!("removing {}", path.display()))?;
+    Ok(names.into_iter().map(|n| format!("{dir_rel}/{n}")).collect())
+}
+
 async fn unpack_all(rel: &str, ctx: &Ctx, send: &impl Fn(LocalState)) -> Result<Vec<String>> {
     let zip_path = ctx.roms_dir.join(rel);
     let dir_rel = rel.rsplit_once('/').map(|(d, _)| d.to_string()).unwrap_or_default();
