@@ -114,19 +114,21 @@ async fn from_zip(
     }
     let url = tb.request_dl(kind, id, zip.id).await?;
     // TorBox sometimes lists a packed zip at the folder's full size but serves only
-    // the first part of it (seen: 2.5 GB of an 898 GB Saturn zip), with no directory.
+    // the first part of it (seen: 2.5 GB of an 898 GB Saturn zip, with no directory).
+    // When the part it serves has a directory of its own, those games are fine.
     let claimed = zip.size as u64;
-    if let Some(served) = crate::remotezip::served_size(&ctx.http, &url).await.context("reading TorBox's zip")?
-        && served < claimed
-    {
-        bail!("{BROKEN_TORBOX_ZIP}: its zip of this folder is cut off ({} of {})", crate::ui::human(served), crate::ui::human(claimed));
-    }
-    let entries =
-        crate::remotezip::list(&ctx.http, &url).await.map_err(|e| anyhow!("{BROKEN_TORBOX_ZIP}: {e:#}")).context("reading TorBox's zip")?;
+    let (entries, served) = crate::remotezip::list_sized(&ctx.http, &url)
+        .await
+        .map_err(|e| anyhow!("{BROKEN_TORBOX_ZIP}: {e:#}"))
+        .context("reading TorBox's zip")?;
+    let served = served.unwrap_or(claimed);
     let want = pick.to_lowercase();
     let Some(entry) = entries.iter().find(|e| e.base_name().to_lowercase() == want) else {
         return Ok(Err(entries.len()));
     };
+    if !entry.ends_by(served) {
+        bail!("{BROKEN_TORBOX_ZIP}: its zip of this folder is cut off ({} of {})", crate::ui::human(served), crate::ui::human(claimed));
+    }
     let rel = format!("{}/{}", game.system, sanitize(pick));
     ensure_dir(ctx, &game.system).await?;
     let dest = ctx.roms_dir.join(&rel);

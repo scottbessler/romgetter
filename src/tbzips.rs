@@ -149,13 +149,30 @@ pub fn held(items: &[Item]) -> std::collections::HashMap<String, Option<std::col
         .collect()
 }
 
+/// Torrents in the account TorBox is still downloading: lowercase info-hash → (state,
+/// progress 0..1).
+pub fn pending(items: &[Item]) -> std::collections::HashMap<String, (String, f64)> {
+    items
+        .iter()
+        .filter(|i| !i.download_present && !i.download_finished && !i.hash.is_empty())
+        .map(|i| {
+            (i.hash.to_lowercase(), (if i.download_state.is_empty() { "queued".into() } else { i.download_state.clone() }, i.progress))
+        })
+        .collect()
+}
+
 /// Files in these sets that aren't games (metadata, extras, video riding along).
 fn is_extra(name: &str) -> bool {
     const EXTS: &[&str] = &[
         "sqlite", "xml", "torrent", "pdf", "exe", "dat", "parts", "mkv", "mp4", "avi", "srt", "nzb", "log", "json", "ini", "bat", "cmd",
         "sh",
     ];
-    crate::jobs::is_junk(name) || EXTS.iter().any(|e| has_ext(name, e))
+    let lower = name.to_lowercase();
+    crate::jobs::is_junk(name)
+        || EXTS.iter().any(|e| has_ext(name, e))
+        // a set's catalog riding along ("CUE sheets USA.7z")
+        || lower.starts_with("cue sheets")
+        || lower.starts_with("cuesheets")
 }
 
 /// A game file of a set (full path inside the torrent or zip).
@@ -190,12 +207,13 @@ pub async fn fetch_index(tb: &TorBox, http: &reqwest::Client, c: &Candidate) -> 
     })
 }
 
-/// A mixed set's file keeps the system its path names; files naming none are dropped.
-fn with_system(mixed: bool, path: &str, f: RomFile) -> Option<RomFile> {
+/// A mixed set's file keeps the system its path names, else the set's `hint`; files
+/// with neither are dropped.
+fn with_system(mixed: bool, path: &str, f: RomFile, hint: Option<&'static str>) -> Option<RomFile> {
     if !mixed {
         return Some(f);
     }
-    let system = file_system(path)?;
+    let system = file_system(path).or(hint)?;
     Some(RomFile { system: Some(system.to_string()), ..f })
 }
 
@@ -215,9 +233,18 @@ fn loose_files(item: &Item, mixed: bool) -> Vec<RomFile> {
                 title: None,
                 system: None,
             };
-            with_system(mixed, &f.name, rom)
+            with_system(mixed, &f.name, rom, None)
         })
         .collect()
+}
+
+/// A system named by a set's catalog files ("REDUMP/ReDump PS2 USA.dat"), for games
+/// sitting in a folder that names none ("REDUMP/GAMES/").
+fn catalog_system<'a>(paths: impl IntoIterator<Item = &'a str>) -> Option<&'static str> {
+    paths.into_iter().filter(|p| ["dat", "xml", "txt"].iter().any(|e| has_ext(p, e))).find_map(|p| {
+        let base = p.rsplit('/').next().unwrap_or(p);
+        crate::systems::guess_from_title(base.rsplit_once('.').map_or(base, |(stem, _)| stem))
+    })
 }
 
 async fn zip_files(tb: &TorBox, http: &reqwest::Client, item: &Item, zip: &RemoteFile, c: &Candidate) -> Result<Vec<RomFile>> {
@@ -225,17 +252,22 @@ async fn zip_files(tb: &TorBox, http: &reqwest::Client, item: &Item, zip: &Remot
     let claimed = zip.size as u64;
     let (entries, served) =
         crate::remotezip::list_sized(http, &url).await.map_err(|e| anyhow!("TorBox's zip of {} can't be read: {e:#}", c.title))?;
-    if served.is_some_and(|s| s < claimed) {
-        bail!("TorBox's zip of {} is cut off", c.title);
-    }
-    Ok(entries
+    // TorBox sometimes serves only the start of a zip (with a directory of just that
+    // part): the games it holds are fine, the rest aren't there.
+    let served = served.unwrap_or(claimed);
+    let hint = if c.mixed() { catalog_system(entries.iter().map(|e| e.name.as_str())) } else { None };
+    let files: Vec<RomFile> = entries
         .iter()
-        .filter(|e| crate::remotezip::is_supported(e.method) && e.size > 0 && is_game(&e.name))
+        .filter(|e| crate::remotezip::is_supported(e.method) && e.size > 0 && is_game(&e.name) && e.ends_by(served))
         .filter_map(|e| {
             let rom = RomFile { name: e.base_name().to_string(), size: e.size, url: None, torrent_index: None, title: None, system: None };
-            with_system(c.mixed(), &e.name, rom)
+            with_system(c.mixed(), &e.name, rom, hint)
         })
-        .collect())
+        .collect();
+    if files.is_empty() && served < claimed {
+        bail!("TorBox's zip of {} is cut off ({} of {})", c.title, crate::ui::human(served), crate::ui::human(claimed));
+    }
+    Ok(files)
 }
 
 #[cfg(test)]
@@ -301,6 +333,8 @@ mod tests {
             ],
             "{got:?}"
         );
+        assert!(!is_game("REDUMP/CUE sheets USA.7z") && is_game("REDUMP/GAMES/Jackass - The Game (USA).7z"));
+        assert_eq!(catalog_system(["REDUMP/GAMES/x.7z", "REDUMP/GAMES MD5.txt", "REDUMP/ReDump PS2 USA.dat"]), Some("ps2"));
         let mixed: Vec<_> = loose_files(&items[10], true).into_iter().map(|f| (f.name, f.system)).collect();
         assert_eq!(
             mixed,

@@ -31,8 +31,7 @@ pub struct RdFile {
     pub id: u64,
     #[serde(default)]
     pub path: String,
-    /// 1 if the file is selected for download (only the tests look).
-    #[cfg(test)]
+    /// 1 if the file is selected for download.
     #[serde(default)]
     pub selected: u8,
 }
@@ -195,6 +194,45 @@ impl RealDebrid {
             .ok_or_else(|| anyhow!("Real-Debrid addMagnet: no id in {text}"))?;
         // Don't leave a half-set-up torrent (no file selected) behind on failure.
         let res = self.select_one(&id, pick).await;
+        if res.is_err() {
+            let _ = self.send(self.http.delete(format!("{BASE}/torrents/delete/{id}"))).await;
+        }
+        res.map(|()| id)
+    }
+
+    /// Put a whole torrent on Real-Debrid (every file selected) so it's cached there; returns
+    /// its RD torrent id. Reuses an RD torrent of the same hash that already has every file.
+    pub async fn add_all(&self, magnet: &str, btih: &str) -> Result<String> {
+        let _turn = self.adds.acquire().await?;
+        for item in self.list().await?.into_iter().filter(|i| i.hash.eq_ignore_ascii_case(btih) && !i.is_failed()) {
+            if self.info(&item.id).await.is_ok_and(|info| !info.files.is_empty() && info.files.iter().all(|f| f.selected == 1)) {
+                return Ok(item.id);
+            }
+        }
+        let text = self.send(self.http.post(format!("{BASE}/torrents/addMagnet")).form(&[("magnet", magnet)])).await?;
+        let id = serde_json::from_str::<serde_json::Value>(&text)?
+            .get("id")
+            .and_then(|v| v.as_str())
+            .map(str::to_string)
+            .ok_or_else(|| anyhow!("Real-Debrid addMagnet: no id in {text}"))?;
+        let res = async {
+            let start = Instant::now();
+            loop {
+                let info = self.info(&id).await?;
+                match info.status.as_str() {
+                    "waiting_files_selection" => break,
+                    s if info.is_failed() => bail!("Real-Debrid couldn't read the torrent ({s})"),
+                    "magnet_conversion" if start.elapsed() < Duration::from_secs(120) => tokio::time::sleep(Duration::from_secs(3)).await,
+                    "magnet_conversion" => bail!("Real-Debrid is still fetching the torrent's file list; try again later"),
+                    _ => return Ok(()), // already selected (cached single-file torrent)
+                }
+            }
+            self.send(self.http.post(format!("{BASE}/torrents/selectFiles/{id}")).form(&[("files", "all")]))
+                .await
+                .context("selecting the files on Real-Debrid")
+                .map(drop)
+        }
+        .await;
         if res.is_err() {
             let _ = self.send(self.http.delete(format!("{BASE}/torrents/delete/{id}"))).await;
         }

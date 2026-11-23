@@ -26,6 +26,12 @@ impl Entry {
     pub fn base_name(&self) -> &str {
         self.name.rsplit('/').next().unwrap_or(&self.name)
     }
+
+    /// The entry's bytes all lie within the first `len` bytes of the zip (its local
+    /// header's extra field isn't known until read, so this is close, not exact).
+    pub fn ends_by(&self, len: u64) -> bool {
+        self.local_header + 30 + self.name.len() as u64 + self.compressed <= len
+    }
 }
 
 async fn range(http: &reqwest::Client, url: &str, spec: &str) -> Result<(Vec<u8>, Option<u64>)> {
@@ -120,11 +126,6 @@ pub async fn list(http: &reqwest::Client, url: &str) -> Result<Vec<Entry>> {
 pub async fn list_sized(http: &reqwest::Client, url: &str) -> Result<(Vec<Entry>, Option<u64>)> {
     let (tail, total) = range(http, url, "-65558").await.context("reading zip footer")?;
     Ok((list_from_tail(http, url, &tail).await?, total))
-}
-
-/// Just the served size of a file (one tiny range request).
-pub async fn served_size(http: &reqwest::Client, url: &str) -> Result<Option<u64>> {
-    Ok(range(http, url, "0-0").await?.1)
 }
 
 async fn list_from_tail(http: &reqwest::Client, url: &str, tail: &[u8]) -> Result<Vec<Entry>> {

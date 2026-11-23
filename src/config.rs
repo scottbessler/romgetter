@@ -41,9 +41,8 @@ pub struct Config {
     /// Search the IF Archive's free interactive fiction (played with Gargoyle).
     #[serde(default = "yes")]
     pub use_ifarchive: bool,
-    /// Search Vimm's Lair (downloaded through a browser). A last resort, so off by
-    /// default; the Search tab's menu toggles it.
-    #[serde(default)]
+    /// Old switch for Vimm's Lair; now `[sources] vimm = true` (read once, then dropped).
+    #[serde(default, skip_serializing)]
     pub use_vimm: bool,
     /// Browser command for Vimm pages (the URL is appended), e.g. "flatpak run org.mozilla.firefox".
     /// Default: Firefox or Chrome if installed, else the system default.
@@ -59,7 +58,16 @@ pub struct Config {
     /// Unlocks "restricted" sets, which then download directly instead of via TorBox.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub archive_login: Option<ArchiveLogin>,
+    /// Sources switched on or off in the Sources tab, over their defaults (all on but
+    /// Vimm's Lair): a set's key ("minerva:Redump/Sony - PlayStation 2", "torbox:<hash>",
+    /// an archive.org identifier), "archive.org" (live search) or "vimm".
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub sources: std::collections::BTreeMap<String, bool>,
 }
+
+/// Live-search sources (Sources tab keys).
+pub const LIVE_ARCHIVE: &str = "archive.org";
+pub const LIVE_VIMM: &str = "vimm";
 
 /// archive.org's login cookies.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -98,6 +106,7 @@ impl Default for Config {
             downloads_dir: None,
             extra_sets: Vec::new(),
             archive_login: None,
+            sources: std::collections::BTreeMap::new(),
         }
     }
 }
@@ -125,7 +134,25 @@ impl Config {
             return Ok(cfg);
         }
         let text = std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
-        toml::from_str(&text).with_context(|| format!("parsing {}", path.display()))
+        let mut cfg: Config = toml::from_str(&text).with_context(|| format!("parsing {}", path.display()))?;
+        if std::mem::take(&mut cfg.use_vimm) {
+            cfg.sources.entry(LIVE_VIMM.into()).or_insert(true);
+        }
+        Ok(cfg)
+    }
+
+    /// Whether a source (see `sources`) is on.
+    pub fn source_on(&self, key: &str) -> bool {
+        self.sources.get(key).copied().unwrap_or(key != LIVE_VIMM)
+    }
+
+    /// Turn a source on or off; a source back at its default leaves the table.
+    pub fn set_source(&mut self, key: &str, on: bool) {
+        if on == (key != LIVE_VIMM) {
+            self.sources.remove(key);
+        } else {
+            self.sources.insert(key.to_string(), on);
+        }
     }
 
     pub fn save(&self, path: &std::path::Path) -> Result<()> {

@@ -1,4 +1,4 @@
-use crate::app::{App, LIB_GROUP_LIMIT, LibInput, Menu, Remote, Row, SearchRow, SetRow, SetState, Tab, TexRow};
+use crate::app::{App, LIB_GROUP_LIMIT, LIVE_GROUP, LIVE_SOURCES, LibInput, Menu, Remote, Row, SearchRow, SetRow, SetState, Tab, TexRow};
 use crate::jobs::LocalState;
 use crate::systems;
 use ratatui::Frame;
@@ -78,7 +78,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
             Tab::Library => {
                 "Enter download/open · Space actions · m menu · D download all ready · t add Metacritic top 20 · ←→ fold · d direct · p paste · / filter · s search · S system · o sort name/size · x remove · X delete from disk · r rescan · q quit"
             }
-            Tab::Sources => "Enter open group / set actions · ←→ fold · m menu · s search · Tab next tab · q quit",
+            Tab::Sources => "Enter open group / set actions · Space on/off · ←→ fold · m menu · s search · Tab next tab · q quit",
             Tab::Textures => {
                 "Enter install / turn on·off · Space actions (pick a build) · m menu · r refresh the pack lists · Tab next tab · q quit"
             }
@@ -126,7 +126,7 @@ fn pad_help(app: &App) -> &'static str {
         Tab::Search => "[A] add / pick a source · [B] actions · [X] search · ←→ fold · [Y] menu · LB/RB tabs · LT/RT page",
         Tab::Library => "[A] download/open · [B] actions · [X] filter · [Y] menu · ←→ fold · LB/RB tabs · LT/RT page",
         Tab::Textures => "[A] install / turn on·off · [B] actions · [Y] menu · LB/RB tabs · LT/RT page",
-        Tab::Sources => "[A] open / actions · [B] actions · ←→ fold · [Y] menu · LB/RB tabs · LT/RT page",
+        Tab::Sources => "[A] open / actions · [B] actions (on/off) · ←→ fold · [Y] menu · LB/RB tabs · LT/RT page",
     }
 }
 
@@ -222,14 +222,38 @@ fn draw_sources(f: &mut Frame, app: &mut App, area: Rect) {
     let items: Vec<ListItem> = rows
         .iter()
         .map(|r| match r {
-            SetRow::Group { name, sets, files, collapsed } => ListItem::new(Line::from(vec![
-                Span::styled(format!("{} {name}", if *collapsed { "▸" } else { "▾" }), Style::new().fg(Color::Magenta).bold()),
-                Span::styled(format!("  {sets} set{} · {files} files", if *sets == 1 { "" } else { "s" }), DIM),
-            ])),
+            SetRow::Group { name, sets, off, files, collapsed } => {
+                let live = *name == LIVE_GROUP;
+                let mut spans = vec![
+                    Span::styled(format!("{} {name}", if *collapsed { "▸" } else { "▾" }), Style::new().fg(Color::Magenta).bold()),
+                    Span::styled(
+                        if live {
+                            format!("  {sets} sites")
+                        } else {
+                            format!("  {sets} set{} · {files} files", if *sets == 1 { "" } else { "s" })
+                        },
+                        DIM,
+                    ),
+                ];
+                if *off > 0 {
+                    let text = if off == sets { "  all off".to_string() } else { format!("  {off} off") };
+                    spans.push(Span::styled(text, Style::new().fg(Color::DarkGray).bold()));
+                }
+                ListItem::new(Line::from(spans))
+            }
+            SetRow::Live(key) => {
+                let on = app.cfg.source_on(key);
+                let title = LIVE_SOURCES.iter().find(|(k, _)| k == key).map_or(*key, |(_, t)| t);
+                let (badge, color) = if on { ("● on", Color::Green) } else { ("○ off", Color::DarkGray) };
+                let mut spans = vec![Span::raw("  "), Span::styled(format!("{badge:<11}"), Style::new().fg(color).bold())];
+                spans.push(Span::styled(title.to_string(), if on { Style::new() } else { DIM }));
+                ListItem::new(Line::from(spans))
+            }
             SetRow::Set(item) => {
                 let sys = app.sets.iter().find(|s| &s.item == item).map(|s| s.system.clone()).unwrap_or_default();
                 let info = app.set_info(item, &sys);
                 let (badge, color, detail) = match &info.state {
+                    _ if !info.on => ("○ off", Color::DarkGray, String::new()),
                     SetState::Indexed if info.cached => ("⚡ cached", Color::Yellow, String::new()),
                     SetState::Indexed => ("● indexed", Color::Green, String::new()),
                     SetState::Indexing => ("… indexing", Color::Cyan, String::new()),
@@ -240,7 +264,7 @@ fn draw_sources(f: &mut Frame, app: &mut App, area: Rect) {
                 let mut spans = vec![
                     Span::raw("  "),
                     Span::styled(format!("{badge:<11}"), Style::new().fg(color).bold()),
-                    Span::raw(info.title.clone()),
+                    Span::styled(info.title.clone(), if info.on { Style::new() } else { DIM }),
                     Span::raw("  "),
                     if info.system.is_empty() {
                         Span::styled("→ several systems", Style::new().fg(Color::Magenta))
@@ -254,6 +278,14 @@ fn draw_sources(f: &mut Frame, app: &mut App, area: Rect) {
                 }
                 if let Some(a) = info.age.filter(|_| matches!(info.state, SetState::Indexed)) {
                     spans.push(Span::styled(format!("  indexed {}", ago(a)), DIM));
+                }
+                for (service, state, progress, done) in &info.caching {
+                    let text = if *done {
+                        format!("  ✓ cached on {service}")
+                    } else {
+                        format!("  ⇣ {service} {state} {:.0}%", progress * 100.0)
+                    };
+                    spans.push(Span::styled(text, Style::new().fg(if *done { Color::Yellow } else { Color::Cyan })));
                 }
                 if !detail.is_empty() {
                     spans.push(Span::styled(format!("  {detail}"), Style::new().fg(Color::Red)));

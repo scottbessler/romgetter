@@ -1,5 +1,5 @@
 use crate::archive::{self, ItemHit, ItemIndex};
-use crate::config::Config;
+use crate::config::{Config, LIVE_ARCHIVE, LIVE_VIMM};
 use crate::gamepad::{self, Pad};
 use crate::ifarchive;
 use crate::jobs::{self, LocalState, LocalTx};
@@ -65,18 +65,29 @@ pub const SET_GROUPS: &[&str] = &[
     "archive.org · restricted (romgetter archive-login)",
     "archive.org · your extra sets",
     "IF Archive",
+    LIVE_GROUP,
 ];
+
+/// The Sources tab's group of sites searched as you type.
+pub const LIVE_GROUP: &str = "Live search (as you type)";
+/// Its rows: (config key, title).
+pub const LIVE_SOURCES: &[(&str, &str)] =
+    &[(LIVE_ARCHIVE, "archive.org search"), (LIVE_VIMM, "Vimm's Lair (downloads open in a browser; a last resort)")];
 
 /// A row of the Sources tab.
 pub enum SetRow {
     Group {
         name: &'static str,
         sets: usize,
+        /// Of those, switched off.
+        off: usize,
         files: usize,
         collapsed: bool,
     },
     /// A search set (its `SetRef::item`).
     Set(String),
+    /// A live-search site (its `LIVE_SOURCES` key).
+    Live(&'static str),
 }
 
 /// What the Sources tab shows for one set.
@@ -98,6 +109,10 @@ pub struct SetInfo {
     pub state: SetState,
     /// Cached on TorBox (a torrent in the account): games come straight away.
     pub cached: bool,
+    /// Switched on in the Sources tab (searched).
+    pub on: bool,
+    /// Debrid services caching the set's torrent: ("TorBox", state, progress, done).
+    pub caching: Vec<(&'static str, String, f64, bool)>,
     /// Indexed this many seconds ago.
     pub age: Option<u64>,
 }
@@ -159,6 +174,9 @@ pub struct RomHit {
     pub title: Option<String>,
 }
 
+/// Torrents TorBox is still downloading (see `tbzips::pending`).
+type TorboxPending = HashMap<String, (String, f64)>;
+
 /// What each torrent in the TorBox account holds (see `tbzips::held`).
 pub type TorboxHeld = HashMap<String, Option<HashSet<String>>>;
 
@@ -202,6 +220,33 @@ pub struct Menu {
     pub sel: usize,
 }
 
+/// A debrid service a set can be cached to from the Sources tab.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Debrid {
+    TorBox,
+    RealDebrid,
+}
+
+impl Debrid {
+    pub fn name(self) -> &'static str {
+        match self {
+            Debrid::TorBox => "TorBox",
+            Debrid::RealDebrid => "Real-Debrid",
+        }
+    }
+}
+
+/// A set torrent sent to a debrid service to cache whole: its state there.
+#[derive(Clone, Debug)]
+pub struct CacheJob {
+    pub state: String,
+    pub progress: f64,
+    pub done: bool,
+}
+
+/// Sets this big or bigger aren't offered for caching (the services balk, and it's slow).
+const CACHE_MAX: u64 = 1_000_000_000_000;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Act {
     AddRom,
@@ -226,7 +271,10 @@ pub enum Act {
     CollapseAll,
     ExpandAll,
     Rescan,
-    ToggleVimm,
+    /// Sources tab: switch the row's source(s) on or off.
+    ToggleSource,
+    /// Sources tab: have this debrid service cache the whole set torrent.
+    CacheTo(Debrid),
     /// Textures tab: install build N of the selected pack.
     TexInstall(usize),
     /// Open build N's page (hosts only a person can use).
@@ -265,7 +313,9 @@ pub enum Msg {
     Indexed(String, anyhow::Result<ItemIndex>),
     MinervaFolders(String, anyhow::Result<Vec<minerva::Folder>>),
     /// Zipped ROM-set torrents found in the TorBox account.
-    TorboxZips(anyhow::Result<(Vec<tbzips::Candidate>, TorboxHeld)>),
+    TorboxZips(anyhow::Result<(Vec<tbzips::Candidate>, TorboxHeld, TorboxPending)>),
+    /// A set torrent sent to a debrid service to cache (service, info-hash, result).
+    CacheSent(Debrid, String, anyhow::Result<String>),
     /// TorBox's cached files per Minerva torrent (hashes asked about, result).
     MinervaCache(Vec<String>, anyhow::Result<HashMap<String, HashSet<String>>>),
     /// A game was put on Real-Debrid (game id, RD torrent id).
@@ -560,6 +610,8 @@ pub struct App {
     sets_open: HashSet<String>,
     /// Why a set's last indexing failed.
     index_errors: HashMap<String, String>,
+    /// Set torrents sent to a debrid service to cache whole (service, info-hash).
+    pub cache_jobs: HashMap<(Debrid, String), CacheJob>,
     /// Where `cfg` came from, for saving settings changed in the app (None in tests).
     pub config_file: Option<PathBuf>,
     tx: UnboundedSender<Msg>,
@@ -676,6 +728,7 @@ impl App {
             sets_state: ListState::default(),
             sets_open: HashSet::new(),
             index_errors: HashMap::new(),
+            cache_jobs: HashMap::new(),
             config_file: None,
             tx,
             local_tx,
@@ -884,23 +937,11 @@ impl App {
         self.watch_downloads();
     }
 
-    /// Show or hide Vimm's Lair in Search, and remember it in the config.
-    fn toggle_vimm(&mut self) {
-        self.cfg.use_vimm = !self.cfg.use_vimm;
-        self.status = if self.cfg.use_vimm {
-            "Vimm's Lair results on (downloads open in a browser)".into()
-        } else {
-            "Vimm's Lair results hidden".into()
-        };
+    fn save_config(&mut self) {
         if let Some(path) = &self.config_file
             && let Err(e) = self.cfg.save(path)
         {
             self.status = format!("{} · couldn't save the config: {e:#}", self.status);
-        }
-        self.vimm_hits.clear();
-        self.merge_hits();
-        if self.cfg.use_vimm && self.rom_query.trim().len() >= 3 {
-            self.start_live_search();
         }
     }
 
@@ -1045,7 +1086,7 @@ impl App {
         let mut longer: Vec<(HashSet<String>, Option<RomHit>)> = vec![(HashSet::new(), None); titles.len()];
         for s in &self.sets {
             let Some(idx) = self.index.get(&s.item) else { continue };
-            if self.hidden(idx) {
+            if self.hidden(idx) || !self.cfg.source_on(&s.item) {
                 continue;
             }
             let set_system = if s.system.is_empty() { idx.system.clone().unwrap_or_default() } else { s.system.clone() };
@@ -1151,7 +1192,10 @@ impl App {
         if self.polls_in_flight > 0 || self.last_poll.is_some_and(|t| t.elapsed() < interval) {
             return;
         }
-        let kinds: HashSet<Kind> = waiting.iter().map(|g| g.torbox_kind()).collect();
+        let mut kinds: HashSet<Kind> = waiting.iter().map(|g| g.torbox_kind()).collect();
+        if self.cache_jobs.iter().any(|((d, _), j)| *d == Debrid::TorBox && !j.done) {
+            kinds.insert(Kind::Torrent);
+        }
         self.last_poll = Some(Instant::now());
         self.refresh_presence();
         for kind in kinds {
@@ -1204,7 +1248,9 @@ impl App {
         let waiting: Vec<&Game> = self.lib.games.iter().filter(|g| g.rd_id.is_some() && !self.present.contains(&g.id)).collect();
         let any_pending = waiting.iter().any(|g| !matches!(self.remote.get(&g.id), Some(Remote::Ready)));
         let interval = if any_pending { self.ctx.poll.max(Duration::from_secs(15)) } else { Duration::from_secs(120) };
-        if waiting.is_empty() || self.rd_polls_in_flight > 0 || self.rd_last_poll.is_some_and(|t| t.elapsed() < interval) {
+        let caching = self.cache_jobs.iter().any(|((d, _), j)| *d == Debrid::RealDebrid && !j.done);
+        let interval = if caching { interval.min(Duration::from_secs(60)) } else { interval };
+        if (waiting.is_empty() && !caching) || self.rd_polls_in_flight > 0 || self.rd_last_poll.is_some_and(|t| t.elapsed() < interval) {
             return;
         }
         self.rd_last_poll = Some(Instant::now());
@@ -1318,7 +1364,8 @@ impl App {
     }
 
     fn start_index(&mut self, item: String) {
-        if !self.indexing.insert(item.clone()) {
+        // switched-off sets aren't indexed until they're switched back on
+        if !self.cfg.source_on(&item) || !self.indexing.insert(item.clone()) {
             return;
         }
         let http = self.ctx.http.clone();
@@ -1346,7 +1393,7 @@ impl App {
         let tx = self.tx.clone();
         self.tb_zips_pending = true;
         tokio::spawn(async move {
-            let res = tb.list(Kind::Torrent).await.map(|items| (tbzips::candidates(&items), tbzips::held(&items)));
+            let res = tb.list(Kind::Torrent).await.map(|items| (tbzips::candidates(&items), tbzips::held(&items), tbzips::pending(&items)));
             let _ = tx.send(Msg::TorboxZips(res));
         });
     }
@@ -1376,11 +1423,15 @@ impl App {
         let restricted_ok = self.cfg.archive_login.is_some();
         // "vimm" in the query only narrows results to Vimm; the sites don't get it.
         let q: String = q.split_whitespace().filter(|w| !w.eq_ignore_ascii_case("vimm")).collect::<Vec<_>>().join(" ");
-        if self.cfg.use_vimm && !q.is_empty() {
+        if self.cfg.source_on(LIVE_VIMM) && !q.is_empty() {
             let (http, tx, q) = (http.clone(), tx.clone(), q.clone());
             tokio::spawn(async move {
                 let _ = tx.send(Msg::Vimm(generation, vimm::search(&http, &q).await));
             });
+        }
+        if !self.cfg.source_on(LIVE_ARCHIVE) {
+            self.live_loading = false;
+            return;
         }
         tokio::spawn(async move {
             let _ = tx.send(Msg::Live(generation, archive::search_games(&http, &q, restricted_ok).await));
@@ -1528,6 +1579,21 @@ impl App {
                     self.remote.insert(id, Remote::Error(format!("Real-Debrid: {e:#}")));
                 }
             },
+            Msg::CacheSent(d, h, res) => match res {
+                Ok(_) => {
+                    let name = self.minerva_name(&h).unwrap_or_else(|| h.clone());
+                    self.status = format!("{} is caching {name}; the Sources tab shows its progress", d.name());
+                    self.cache_jobs.insert((d, h), CacheJob { state: "queued".into(), progress: 0.0, done: false });
+                    match d {
+                        Debrid::TorBox => self.last_poll = None,
+                        Debrid::RealDebrid => self.rd_last_poll = None,
+                    }
+                }
+                Err(e) => {
+                    self.cache_jobs.remove(&(d, h));
+                    self.status = format!("{} couldn't take the torrent: {e:#}", d.name());
+                }
+            },
             Msg::RdList(res) => {
                 self.rd_polls_in_flight = 0;
                 let items = match res {
@@ -1537,6 +1603,16 @@ impl App {
                         return;
                     }
                 };
+                for ((_, h), job) in self.cache_jobs.iter_mut().filter(|((d, _), j)| *d == Debrid::RealDebrid && !j.done) {
+                    // the whole-torrent copy: the one with the most progress for this hash
+                    if let Some(i) =
+                        items.iter().filter(|i| i.hash.eq_ignore_ascii_case(h)).max_by(|a, b| a.progress.total_cmp(&b.progress))
+                    {
+                        job.done = i.is_ready();
+                        job.state = if job.done { "cached".into() } else { i.status.clone() };
+                        job.progress = i.progress / 100.0;
+                    }
+                }
                 let by_id: HashMap<&str, &crate::realdebrid::ListItem> = items.iter().map(|i| (i.id.as_str(), i)).collect();
                 let mut gone = Vec::new();
                 for g in self.lib.games.iter().filter(|g| !self.present.contains(&g.id)) {
@@ -1625,8 +1701,13 @@ impl App {
                 }
             }
             Msg::TorboxZips(res) => match res {
-                Ok((cands, held)) => {
+                Ok((cands, held, pending)) => {
                     self.tb_held = held;
+                    // set torrents TorBox is still caching (sent from the Sources tab earlier)
+                    let sets: HashSet<String> = self.index.values().filter_map(|i| i.btih.as_deref()).map(str::to_lowercase).collect();
+                    for (h, (state, progress)) in pending.into_iter().filter(|(h, _)| sets.contains(h)) {
+                        self.cache_jobs.insert((Debrid::TorBox, h), CacheJob { state, progress, done: false });
+                    }
                     if let Ok(json) = serde_json::to_vec(&cands) {
                         let _ = std::fs::create_dir_all(&self.cache_dir);
                         let _ = std::fs::write(tb_zips_path(&self.cache_dir), json);
@@ -1747,6 +1828,14 @@ impl App {
                     && !items.is_empty()
                 {
                     self.tb_held = tbzips::held(items);
+                    let pending = tbzips::pending(items);
+                    for ((_, h), job) in self.cache_jobs.iter_mut().filter(|((d, _), _)| *d == Debrid::TorBox) {
+                        match pending.get(h) {
+                            Some((state, progress)) => (job.state, job.progress) = (state.clone(), *progress),
+                            None if self.tb_held.contains_key(h) => (job.state, job.progress, job.done) = ("cached".into(), 1.0, true),
+                            None => {}
+                        }
+                    }
                 }
                 match res {
                     // An empty list while games are waiting is almost always a TorBox hiccup;
@@ -1918,7 +2007,7 @@ impl App {
             self.build_hays(None);
             'outer: for s in &self.sets {
                 let Some(idx) = self.index.get(&s.item) else { continue };
-                if self.hidden(idx) {
+                if self.hidden(idx) || !self.cfg.source_on(&s.item) {
                     continue;
                 }
                 let Some(hay) = self.hay.get(&s.item) else { continue };
@@ -2281,7 +2370,14 @@ impl App {
         let cached = tbzips::parse_key(item).is_some()
             || idx.and_then(|i| i.btih.as_deref()).is_some_and(|h| matches!(self.tb_held.get(&h.to_lowercase()), Some(None)));
         let system = if system.is_empty() { idx.and_then(|i| i.system.clone()).unwrap_or_default() } else { system.to_string() };
+        let h = idx.and_then(|i| i.btih.as_deref()).map(str::to_lowercase).unwrap_or_default();
+        let caching = [Debrid::TorBox, Debrid::RealDebrid]
+            .into_iter()
+            .filter_map(|d| self.cache_jobs.get(&(d, h.clone())).map(|j| (d.name(), j.state.clone(), j.progress, j.done)))
+            .collect();
         SetInfo {
+            caching,
+            on: self.cfg.source_on(item),
             title,
             system,
             files: idx.map_or(0, |i| i.files.len()),
@@ -2297,6 +2393,15 @@ impl App {
         let order = |s: &str| systems::SYSTEMS.iter().position(|(f, _)| *f == s).unwrap_or(usize::MAX);
         let mut rows = Vec::new();
         for name in SET_GROUPS {
+            if *name == LIVE_GROUP {
+                let open = self.sets_open.contains(LIVE_GROUP);
+                let off = LIVE_SOURCES.iter().filter(|(k, _)| !self.cfg.source_on(k)).count();
+                rows.push(SetRow::Group { name, sets: LIVE_SOURCES.len(), off, files: 0, collapsed: !open });
+                if open {
+                    rows.extend(LIVE_SOURCES.iter().map(|(k, _)| SetRow::Live(k)));
+                }
+                continue;
+            }
             let mut sets: Vec<(&SetRef, String)> = self
                 .sets
                 .iter()
@@ -2308,8 +2413,9 @@ impl App {
             }
             sets.sort_by(|a, b| (order(&a.0.system), &a.1).cmp(&(order(&b.0.system), &b.1)));
             let files = sets.iter().filter_map(|(s, _)| self.index.get(&s.item)).map(|i| i.files.len()).sum();
+            let off = sets.iter().filter(|(s, _)| !self.cfg.source_on(&s.item)).count();
             let open = self.sets_open.contains(*name);
-            rows.push(SetRow::Group { name, sets: sets.len(), files, collapsed: !open });
+            rows.push(SetRow::Group { name, sets: sets.len(), off, files, collapsed: !open });
             if open {
                 rows.extend(sets.into_iter().map(|(s, _)| SetRow::Set(s.item.clone())));
             }
@@ -2321,6 +2427,61 @@ impl App {
         match row {
             SetRow::Group { name, .. } => format!("\u{1}{name}"),
             SetRow::Set(item) => item.clone(),
+            SetRow::Live(key) => format!("\u{2}{key}"),
+        }
+    }
+
+    /// The live-search source under the Sources cursor.
+    fn selected_live(&self) -> Option<&'static str> {
+        let key = self.sets_cursor.as_deref()?.strip_prefix('\u{2}')?;
+        LIVE_SOURCES.iter().map(|(k, _)| *k).find(|k| *k == key)
+    }
+
+    /// Source keys a Sources row stands for: a set or site, or every one in a group.
+    fn row_sources(&self) -> Vec<String> {
+        if let Some(k) = self.selected_live() {
+            return vec![k.to_string()];
+        }
+        if let Some(s) = self.selected_set() {
+            return vec![s.item];
+        }
+        match self.sets_cursor_group() {
+            Some(LIVE_GROUP) => LIVE_SOURCES.iter().map(|(k, _)| k.to_string()).collect(),
+            Some(g) => self.sets.iter().filter(|s| self.set_group(&s.item) == g).map(|s| s.item.clone()).collect(),
+            None => Vec::new(),
+        }
+    }
+
+    /// Space / menu: switch the row's sources on or off (a group: all off if any is on,
+    /// else all on). Saved to the config; search results follow at once.
+    fn toggle_source_row(&mut self) {
+        let keys = self.row_sources();
+        if keys.is_empty() {
+            return;
+        }
+        let on = !keys.iter().any(|k| self.cfg.source_on(k));
+        for k in &keys {
+            self.cfg.set_source(k, on);
+        }
+        let what = match keys.as_slice() {
+            [k] => LIVE_SOURCES
+                .iter()
+                .find(|(key, _)| key == k)
+                .map(|(_, t)| t.split(" (").next().unwrap_or(t).to_string())
+                .unwrap_or_else(|| self.set_info(k, "").title),
+            _ => format!("{} sources", keys.len()),
+        };
+        self.status = format!("{what} {}", if on { "on" } else { "off" });
+        self.save_config();
+        if on {
+            let missing: Vec<String> =
+                keys.iter().filter(|k| self.sets.iter().any(|s| &s.item == *k) && !self.index.contains_key(*k)).cloned().collect();
+            for k in missing {
+                self.start_index(k);
+            }
+        }
+        if !self.rom_query.trim().is_empty() {
+            self.on_query_change();
         }
     }
 
@@ -2332,6 +2493,9 @@ impl App {
 
     fn sets_cursor_group(&self) -> Option<&'static str> {
         let c = self.sets_cursor.as_ref()?;
+        if c.starts_with('\u{2}') {
+            return Some(LIVE_GROUP);
+        }
         match c.strip_prefix('\u{1}') {
             Some(name) => SET_GROUPS.iter().find(|g| **g == name).copied(),
             None => Some(self.set_group(c)),
@@ -2349,6 +2513,7 @@ impl App {
 
     fn activate_set_row(&mut self) {
         match self.selected_set() {
+            _ if self.selected_live().is_some() => self.set_item_menu(),
             Some(_) => self.set_item_menu(),
             None => {
                 if let Some(g) = self.sets_cursor_group().or(SET_GROUPS.first().copied()) {
@@ -2361,18 +2526,35 @@ impl App {
     }
 
     fn set_item_menu(&mut self) {
+        if let Some(k) = self.selected_live() {
+            let title = LIVE_SOURCES.iter().find(|(key, _)| *key == k).map_or(k, |(_, t)| t);
+            let toggle = if self.cfg.source_on(k) { "Turn off" } else { "Turn on" };
+            self.menu =
+                Some(Menu { title: title.into(), items: vec![(toggle.into(), Act::ToggleSource), ("Close".into(), Act::Close)], sel: 0 });
+            return;
+        }
         let Some(s) = self.selected_set() else {
             let Some(g) = self.sets_cursor_group() else { return };
             let open = self.sets_open.contains(g);
-            self.menu = Some(Menu { title: g.into(), items: vec![(if open { "Close" } else { "Open" }.into(), Act::Fold)], sel: 0 });
+            let toggle = if self.row_sources().iter().any(|k| self.cfg.source_on(k)) { "Turn all off" } else { "Turn all on" };
+            self.menu = Some(Menu {
+                title: g.into(),
+                items: vec![(if open { "Close" } else { "Open" }.into(), Act::Fold), (toggle.into(), Act::ToggleSource)],
+                sel: 0,
+            });
             return;
         };
         let info = self.set_info(&s.item, &s.system);
-        let mut items = Vec::new();
-        if !info.system.is_empty() {
+        let mut items = vec![(if info.on { "Turn off" } else { "Turn on" }.into(), Act::ToggleSource)];
+        if !info.system.is_empty() && info.on {
             items.push((format!("Search {}", systems::label(&info.system)), Act::SetSearch));
         }
-        items.push((if self.indexing.contains(&s.item) { "Indexing…" } else { "Index again now" }.into(), Act::Reindex));
+        if info.on {
+            items.push((if self.indexing.contains(&s.item) { "Indexing…" } else { "Index again now" }.into(), Act::Reindex));
+        }
+        for d in self.cache_targets(&s.item) {
+            items.push((format!("Cache to {}", d.name()), Act::CacheTo(d)));
+        }
         items.push(("Close".into(), Act::Close));
         self.menu = Some(Menu { title: info.title, items, sel: 0 });
     }
@@ -2385,6 +2567,64 @@ impl App {
         self.rom_query = format!("{sys} ");
         self.editing = true;
         self.on_query_change();
+    }
+
+    /// Whether TorBox already has this whole torrent: in the account, or fully cached.
+    fn torbox_has_all(&self, btih: &str, idx: &ItemIndex) -> bool {
+        let h = btih.to_lowercase();
+        let names = || idx.files.iter().map(|f| f.name.rsplit('/').next().unwrap_or(&f.name).to_lowercase()).collect::<HashSet<_>>();
+        match self.tb_held.get(&h) {
+            Some(None) => return true,
+            Some(Some(files)) if fully_cached(&names(), files) => return true,
+            _ => {}
+        }
+        matches!(self.minerva_cache.get(&h), Some(TorrentCache { files: None }))
+    }
+
+    /// Debrid services a set's torrent can be sent to for caching: torrent-backed sets
+    /// under 1 TB that the service doesn't have whole and isn't caching already.
+    fn cache_targets(&self, item: &str) -> Vec<Debrid> {
+        let Some(idx) = self.index.get(item) else { return Vec::new() };
+        let Some(h) = idx.btih.as_deref().filter(|_| tbzips::parse_key(item).is_none()) else { return Vec::new() };
+        if idx.files.iter().map(|f| f.size).sum::<u64>() >= CACHE_MAX {
+            return Vec::new();
+        }
+        let busy = |d: Debrid| self.cache_jobs.contains_key(&(d, h.to_lowercase()));
+        let mut out = Vec::new();
+        if self.ctx.torbox.is_some() && !busy(Debrid::TorBox) && !self.torbox_has_all(h, idx) {
+            out.push(Debrid::TorBox);
+        }
+        if self.ctx.rd.is_some() && !busy(Debrid::RealDebrid) {
+            out.push(Debrid::RealDebrid);
+        }
+        out
+    }
+
+    /// Send the selected set's whole torrent to a debrid service to cache.
+    fn cache_selected_set(&mut self, d: Debrid) {
+        let Some(s) = self.selected_set() else { return };
+        let Some(h) = self.index.get(&s.item).and_then(|i| i.btih.clone()).map(|h| h.to_lowercase()) else { return };
+        let magnet = minerva::magnet(&h);
+        let name = self.minerva_name(&h);
+        let tx = self.tx.clone();
+        self.cache_jobs.insert((d, h.clone()), CacheJob { state: "sending".into(), progress: 0.0, done: false });
+        self.status = format!("sending {} to {}…", self.set_info(&s.item, &s.system).title, d.name());
+        match d {
+            Debrid::TorBox => {
+                let Some(tb) = self.ctx.torbox.clone() else { return };
+                tokio::spawn(async move {
+                    let res = tb.create(Kind::Torrent, &magnet, name.as_deref(), false).await.map(|id| id.to_string());
+                    let _ = tx.send(Msg::CacheSent(d, h, res));
+                });
+            }
+            Debrid::RealDebrid => {
+                let Some(rd) = self.ctx.rd.clone() else { return };
+                tokio::spawn(async move {
+                    let res = rd.add_all(&magnet, &h).await;
+                    let _ = tx.send(Msg::CacheSent(d, h, res));
+                });
+            }
+        }
     }
 
     fn reindex_selected_set(&mut self) {
@@ -2942,8 +3182,6 @@ impl App {
         let title = match self.tab {
             Tab::Search => {
                 items.push(("Search…".into(), Act::Search));
-                let vimm = if self.cfg.use_vimm { "on" } else { "off (last resort)" };
-                items.push((format!("Vimm's Lair results: {vimm}"), Act::ToggleVimm));
                 "Search"
             }
             Tab::Library => {
@@ -3082,7 +3320,8 @@ impl App {
             Act::SetSearch => self.search_set_system(),
             Act::Reindex => self.reindex_selected_set(),
             Act::Rescan => self.press(KeyCode::Char('r')),
-            Act::ToggleVimm => self.toggle_vimm(),
+            Act::ToggleSource => self.toggle_source_row(),
+            Act::CacheTo(d) => self.cache_selected_set(d),
             Act::TexInstall(_) | Act::TexOpenUrl(_) | Act::TexToggle | Act::TexRemove | Act::TexPage | Act::TexRefresh => self.tex_run(act),
             Act::Quit => self.quit = true,
         }
@@ -3178,6 +3417,7 @@ impl App {
                 }
                 (Tab::Textures, KeyCode::Enter) => self.tex_activate(),
                 (Tab::Sources, KeyCode::Enter) => self.activate_set_row(),
+                (Tab::Sources, KeyCode::Char(' ')) => self.toggle_source_row(),
                 (Tab::Sources, KeyCode::Left | KeyCode::Right | KeyCode::Char('h' | 'l')) => {
                     if let Some(g) = self.sets_cursor_group() {
                         let open = matches!(code, KeyCode::Right | KeyCode::Char('l'));
@@ -3420,10 +3660,15 @@ mod tests {
             app.set_rows()
                 .iter()
                 .map(|r| match r {
-                    SetRow::Group { name, sets, files, collapsed } => {
-                        format!("G {name} {sets} {files}{}", if *collapsed { " closed" } else { "" })
+                    SetRow::Group { name, sets, off, files, collapsed } => {
+                        format!(
+                            "G {name} {sets} {files}{}{}",
+                            if *off > 0 { format!(" {off}off") } else { String::new() },
+                            if *collapsed { " closed" } else { "" }
+                        )
                     }
                     SetRow::Set(item) => format!("S {item}"),
+                    SetRow::Live(key) => format!("L {key}"),
                 })
                 .collect()
         };
@@ -3434,6 +3679,7 @@ mod tests {
                 "G Minerva · Redump 1 3 closed",
                 "G archive.org · built-in sets 1 2 closed",
                 "G archive.org · restricted (romgetter archive-login) 1 5 closed",
+                "G Live search (as you type) 2 0 1off closed",
             ]
         );
         // Enter on the first group opens it; its failed set shows why
@@ -3447,9 +3693,97 @@ mod tests {
         assert!(matches!(app.set_info("microsoft_xbox360_a_part1", "xbox360").state, SetState::Locked));
         // Enter on a set: its actions; "Search" jumps to the Search tab filtered to its system
         app.press(KeyCode::Enter);
-        assert_eq!(app.menu.as_ref().map(|m| m.items[0].1), Some(Act::SetSearch));
+        let acts: Vec<Act> = app.menu.as_ref().unwrap().items.iter().map(|i| i.1).collect();
+        assert_eq!(acts[..2], [Act::ToggleSource, Act::SetSearch]);
+        app.press(KeyCode::Down);
         app.press(KeyCode::Enter);
         assert!(app.tab == Tab::Search && app.editing && app.rom_query == "gb ");
+    }
+
+    /// Space switches a set, a group or a live site off and on; off sets drop out of
+    /// search, and the choice is saved (Vimm starts off; the old `use_vimm` carries over).
+    #[tokio::test]
+    async fn sources_switch_on_and_off() {
+        let mut app = test_app(Vec::new());
+        let path = app.ctx.roms_dir.parent().unwrap().join("sources-toggle.toml");
+        app.config_file = Some(path.clone());
+        let file = |n: &str| archive::RomFile { name: n.into(), size: 1, url: None, torrent_index: None, title: None, system: None };
+        for (item, game) in [("set.a", "Crash Bandicoot (USA).zip"), ("set.b", "Crash Bandicoot (Europe).zip")] {
+            app.sets.push(SetRef { item: item.into(), system: "psx".into() });
+            app.index.insert(
+                item.into(),
+                ItemIndex { restricted: false, files: vec![file(game)], system: None, title: item.into(), fetched: 0, btih: None },
+            );
+        }
+        app.refresh_local_for("crash");
+        assert_eq!(app.local_hits.len(), 2);
+        app.tab = Tab::Sources;
+        app.editing = false;
+        app.sets_open.insert(SET_GROUPS[3].into());
+        app.sets_cursor = Some("set.a".into());
+        app.press(KeyCode::Char(' '));
+        assert!(!app.cfg.source_on("set.a") && !app.set_info("set.a", "psx").on);
+        assert_eq!(app.local_hits.iter().map(|h| h.source.as_str()).collect::<Vec<_>>(), vec!["set.b"]);
+        // the group: some on → all off; then all back on
+        app.sets_cursor = Some(format!("\u{1}{}", SET_GROUPS[3]));
+        app.press(KeyCode::Char(' '));
+        assert!(app.local_hits.is_empty());
+        app.press(KeyCode::Char(' '));
+        assert_eq!(app.local_hits.len(), 2);
+        assert!(app.cfg.sources.is_empty(), "back at the defaults: {:?}", app.cfg.sources);
+        // Vimm: off by default, Space turns it on and that's saved
+        assert!(!app.cfg.source_on(LIVE_VIMM) && app.cfg.source_on(LIVE_ARCHIVE));
+        app.sets_cursor = Some(format!("\u{2}{LIVE_VIMM}"));
+        app.press(KeyCode::Char(' '));
+        assert!(Config::load(&path).unwrap().source_on(LIVE_VIMM));
+        // an old config's `use_vimm = true` becomes `[sources] vimm = true`
+        std::fs::write(&path, "roms_dir = \"/tmp/roms\"\nuse_vimm = true\n").unwrap();
+        let old = Config::load(&path).unwrap();
+        assert!(old.source_on(LIVE_VIMM) && !toml::to_string(&old).unwrap().contains("use_vimm"));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A torrent-backed set under 1 TB that a service doesn't have whole offers "Cache to
+    /// <service>"; sets TorBox has whole, TorBox torrents, huge sets and sets being cached
+    /// don't.
+    #[tokio::test]
+    async fn sources_offer_caching_to_debrid() {
+        let mut app = test_app(Vec::new());
+        app.ctx.torbox = Some(crate::torbox::TorBox::new(reqwest::Client::new(), "k".into()));
+        app.ctx.rd = Some(crate::realdebrid::RealDebrid::new(reqwest::Client::new(), "k".into()));
+        let set = |h: &str, size: u64| ItemIndex {
+            restricted: false,
+            files: vec![archive::RomFile { name: "a.zip".into(), size, url: None, torrent_index: Some(0), title: None, system: None }],
+            system: Some("psx".into()),
+            title: "Minerva · Redump · x".into(),
+            fetched: 0,
+            btih: Some(h.into()),
+        };
+        let small = minerva::set_key("Redump", "Sony - PlayStation");
+        let huge = minerva::set_key("Redump", "Sony - PlayStation 3");
+        let held = minerva::set_key("No-Intro", "Nintendo - Game Boy");
+        let tbset = tbzips::set_key("dd");
+        for (k, i) in
+            [(&small, set("AA", 5 << 30)), (&huge, set("bb", 2 * CACHE_MAX)), (&held, set("cc", 1 << 20)), (&tbset, set("dd", 1 << 30))]
+        {
+            app.sets.push(SetRef { item: k.clone(), system: "psx".into() });
+            app.index.insert(k.clone(), i);
+        }
+        app.tb_held.insert("cc".into(), None);
+        assert_eq!(app.cache_targets(&small), vec![Debrid::TorBox, Debrid::RealDebrid]);
+        assert_eq!(app.cache_targets(&huge), vec![]);
+        assert_eq!(app.cache_targets(&held), vec![Debrid::RealDebrid]);
+        assert_eq!(app.cache_targets(&tbset), vec![]);
+        // the set's menu lists them; once one is sent, it's no longer offered
+        app.tab = Tab::Sources;
+        app.editing = false;
+        app.sets_cursor = Some(small.clone());
+        app.press(KeyCode::Enter);
+        let acts: Vec<Act> = app.menu.as_ref().unwrap().items.iter().map(|i| i.1).collect();
+        assert!(acts.contains(&Act::CacheTo(Debrid::TorBox)) && acts.contains(&Act::CacheTo(Debrid::RealDebrid)), "{acts:?}");
+        app.cache_jobs.insert((Debrid::TorBox, "aa".into()), CacheJob { state: "downloading".into(), progress: 0.4, done: false });
+        assert_eq!(app.cache_targets(&small), vec![Debrid::RealDebrid]);
+        assert_eq!(app.set_info(&small, "psx").caching, vec![("TorBox", "downloading".to_string(), 0.4, false)]);
     }
 
     fn test_app(games: Vec<Game>) -> App {
@@ -3855,7 +4189,6 @@ mod tests {
         // Y: the tab menu; B closes; LB/RB switch tabs
         app.on_pad(Pad::Y);
         assert_eq!(menu_acts(&app)[0], Act::Search);
-        assert!(!menu_acts(&app).contains(&Act::ToggleVimm), "Vimm's toggle is on the Search tab's menu");
         assert_eq!(*menu_acts(&app).last().unwrap(), Act::Quit);
         app.on_pad(Pad::B);
         app.tex.loading = true; // no network fetch of the texture lists from a test
@@ -4050,25 +4383,6 @@ mod tests {
         assert_eq!(busy, vec![vimm::page_url(1127).as_str()]);
         assert!(app.dl_claimed.contains(&dl.join("Chrono Trigger (USA).zip")));
         let _ = std::fs::remove_dir_all(&dl);
-    }
-
-    /// Vimm is off by default; the Search menu turns it on and saves that to the config.
-    #[tokio::test]
-    async fn vimm_toggle_is_saved() {
-        let mut app = test_app(vec![]);
-        assert!(!app.cfg.use_vimm);
-        let path = app.ctx.roms_dir.parent().unwrap().join("vimm-toggle.toml");
-        app.config_file = Some(path.clone());
-        app.tab = Tab::Search;
-        app.editing = false;
-        app.on_pad(Pad::Y);
-        let i = menu_acts(&app).iter().position(|a| *a == Act::ToggleVimm).unwrap();
-        assert!(app.menu.as_ref().unwrap().items[i].0.ends_with("off (last resort)"));
-        app.menu.as_mut().unwrap().sel = i;
-        app.on_pad(Pad::A);
-        assert!(app.cfg.use_vimm);
-        assert!(Config::load(&path).unwrap().use_vimm);
-        let _ = std::fs::remove_file(&path);
     }
 
     /// The help line follows whichever input was used last; on-screen-keyboard typing in a
