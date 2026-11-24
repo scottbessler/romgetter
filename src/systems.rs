@@ -407,17 +407,26 @@ pub fn guess_from_title(title: &str) -> Option<&'static str> {
 /// Exact system name/alias for a search phrase: "ps3", "snes", "game boy advance",
 /// "megadrive", a folder name like "n3ds", or a label like "sony - playstation 3".
 pub fn alias(phrase: &str) -> Option<&'static str> {
+    // Every system's names, normalized once: search parses thousands of names a keystroke.
+    static NAMES: std::sync::OnceLock<Vec<(String, &'static str)>> = std::sync::OnceLock::new();
     let p = normalize_one(phrase, false);
     let p = p.trim();
     if p.is_empty() {
         return None;
     }
-    // "if" is an ordinary word in titles ("What If"): only "interactive fiction" names it.
-    SYSTEMS
-        .iter()
-        .find(|(f, l)| (*f != "if" && normalize_one(f, false).trim() == p) || normalize_one(l, false).trim() == p)
-        .map(|(f, _)| *f)
-        .or_else(|| TITLE_PATTERNS.iter().find(|(pat, _)| *pat == p).map(|(_, s)| *s))
+    let names = NAMES.get_or_init(|| {
+        let mut v = Vec::new();
+        for (f, l) in SYSTEMS {
+            // "if" is an ordinary word in titles ("What If"): only "interactive fiction" names it.
+            if *f != "if" {
+                v.push((normalize_one(f, false).trim().to_string(), *f));
+            }
+            v.push((normalize_one(l, false).trim().to_string(), *f));
+        }
+        v.extend(TITLE_PATTERNS.iter().map(|(pat, sys)| (pat.to_string(), *sys)));
+        v
+    });
+    names.iter().find(|(n, _)| n == p).map(|(_, f)| *f)
 }
 
 /// A parsed search: words that name a system act as system filters
@@ -471,9 +480,38 @@ impl Query {
             })
     }
 
+    /// `matches_any` for the files of one set, the set's text checked once: words it
+    /// already has needn't match each file.
+    pub fn for_set(&self, set_text: &str) -> SetQuery<'_> {
+        SetQuery {
+            text: self.text.iter().map(String::as_str).filter(|t| !starts_word(set_text, t)).collect(),
+            systems: self.systems.iter().map(|(phrase, sys)| (phrase.as_str(), *sys, contains_word(set_text, phrase))).collect(),
+        }
+    }
+
     /// Words to send to a title search (system words are applied as filters afterwards).
     pub fn text_query(&self) -> String {
         self.text.join(" ")
+    }
+}
+
+/// A `Query` ready for one set's files (see `Query::for_set`).
+pub struct SetQuery<'a> {
+    /// Text words the set's text doesn't have.
+    text: Vec<&'a str>,
+    /// (system words, the system, the set's text has them)
+    systems: Vec<(&'a str, &'static str, bool)>,
+}
+
+impl SetQuery<'_> {
+    /// Same as `Query::matches_any(&[name, set_text], system)`; `label` is `label_lower(system)`.
+    pub fn matches(&self, name: &str, label: &str, system: &str) -> bool {
+        self.text.iter().all(|t| starts_word(name, t) || starts_word(label, t))
+            && self.systems.iter().all(
+                |&(phrase, sys, in_set)| {
+                    if system.is_empty() { in_set || contains_word(name, phrase) } else { same_system(sys, system) }
+                },
+            )
     }
 }
 

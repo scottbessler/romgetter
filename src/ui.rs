@@ -143,7 +143,14 @@ fn input(f: &mut Frame, area: Rect, title: String, value: &str, editing: bool) {
 
 fn draw_search(f: &mut Frame, app: &mut App, area: Rect) {
     let [inp, list] = Layout::vertical([Constraint::Length(3), Constraint::Min(1)]).areas(area);
-    let indexing = if app.busy() { format!(" · indexing {}/{} sets…", app.indexed_sets(), app.sets.len()) } else { String::new() };
+    let indexing = if app.busy() {
+        format!(" · indexing {}/{} sets…", app.indexed_sets(), app.sets.len())
+    } else {
+        match app.hays_pending() {
+            0 => String::new(),
+            n => format!(" · preparing {n} sets for search…"),
+        }
+    };
     input(
         f,
         inp,
@@ -152,8 +159,9 @@ fn draw_search(f: &mut Frame, app: &mut App, area: Rect) {
         app.editing,
     );
     let games = app.search_rows.iter().filter(|r| matches!(r, SearchRow::Game(_))).count();
-    let items: Vec<ListItem> = app
-        .search_rows
+    // Only the rows on screen: a short query has thousands.
+    let (shown, mut state) = window(&mut app.rom_state, app.search_rows.len(), list.height.saturating_sub(2) as usize);
+    let items: Vec<ListItem> = app.search_rows[shown]
         .iter()
         .map(|r| match r {
             SearchRow::Header { system, count, collapsed } => {
@@ -208,7 +216,25 @@ fn draw_search(f: &mut Frame, app: &mut App, area: Rect) {
         .collect();
     let live = if app.live_loading { " · searching archive.org…" } else { "" };
     let title = format!(" Results ({games}){live} · ⚡ cached on TorBox · ✓ in library · ● on disk · Enter: add / pick a source ");
-    f.render_stateful_widget(List::new(items).block(border(title, !app.editing)).highlight_style(HL), list, &mut app.rom_state);
+    f.render_stateful_widget(List::new(items).block(border(title, !app.editing)).highlight_style(HL), list, &mut state);
+}
+
+/// The rows of a long list that fit in `height`, scrolled to keep the selection in view
+/// (as `List` would), and a state for drawing just those rows.
+fn window(state: &mut ListState, len: usize, height: usize) -> (std::ops::Range<usize>, ListState) {
+    let height = height.max(1);
+    let sel = state.selected().map(|s| s.min(len.saturating_sub(1)));
+    let mut offset = state.offset().min(len.saturating_sub(height));
+    if let Some(s) = sel {
+        if s < offset {
+            offset = s;
+        } else if s >= offset + height {
+            offset = s + 1 - height;
+        }
+    }
+    *state.offset_mut() = offset;
+    let end = (offset + height).min(len);
+    (offset..end, ListState::default().with_selected(sel.map(|s| s - offset)))
 }
 
 fn ago(secs: u64) -> String {

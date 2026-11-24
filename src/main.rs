@@ -167,6 +167,7 @@ async fn main() -> Result<()> {
                     app.on_msg(m);
                 }
             }
+            app.build_hays_now();
             app
         };
         let titles = match metacritic::top_list(&system) {
@@ -183,6 +184,44 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
+    // `romgetter bench`: time startup, search and drawing on this machine's data (offline).
+    if args.first().map(String::as_str) == Some("bench") {
+        use std::time::Instant;
+        let ms = |t: Instant| t.elapsed().as_secs_f64() * 1000.0;
+        let ctx = jobs::Ctx { torbox: None, rd: None, ..ctx };
+        let t = Instant::now();
+        let mut app = App::new(cfg, paths.cache_dir.clone(), lib, tx, local_tx, ctx);
+        println!("{:>8.1} ms  start ({} sets, {} games in the library)", ms(t), app.sets.len(), app.lib.games.len());
+        let t = Instant::now();
+        app.build_hays_now();
+        println!("{:>8.1} ms  search text for {} files (in the background in the app)", ms(t), app.total_files());
+        app.editing = false;
+        let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 40))?;
+        for tab in app::Tab::ALL {
+            app.tab = tab;
+            let t = Instant::now();
+            term.draw(|f| ui::draw(f, &mut app))?;
+            println!("{:>8.1} ms  draw {}", ms(t), tab.title());
+        }
+        app.tab = app::Tab::Search;
+        for q in ["s", "su", "sup", "super", "super m", "super mario", "zelda", "zelda gba", "ps2", "f"] {
+            let t = Instant::now();
+            app.refresh_local_for(q);
+            let first = ms(t);
+            let t = Instant::now();
+            app.refresh_local_for(q);
+            let t2 = Instant::now();
+            term.draw(|f| ui::draw(f, &mut app))?;
+            println!(
+                "{first:>8.1} ms  search {q:?} ({:.1} ms again, draw {:.1} ms; {} rows)",
+                t2.duration_since(t).as_secs_f64() * 1000.0,
+                ms(t2),
+                app.search_rows.len()
+            );
+        }
+        return Ok(());
+    }
+
     if args.first().map(String::as_str) == Some("search") {
         // TorBox stays: its zipped ROM-set torrents are searchable sets
         let ctx = jobs::Ctx { rd: None, ..ctx };
@@ -194,6 +233,7 @@ async fn main() -> Result<()> {
             }
         }
         eprintln!("\r{} files in {} sets", app.total_files(), app.indexed_sets());
+        app.build_hays_now();
         let t0 = std::time::Instant::now();
         app.refresh_local_for(&args[1..].join(" "));
         let first = t0.elapsed();

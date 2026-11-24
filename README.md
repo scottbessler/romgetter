@@ -207,6 +207,7 @@ cargo clippy --fix --allow-dirty                    # apply clippy's suggestions
 cargo test                                          # offline unit tests
 cargo test -- --ignored live                        # live archive.org / Minerva / Vimm / TorBox checks (some need keys)
 cargo test detect_report -- --ignored --nocapture   # system-detection coverage over real sets
+romgetter bench                                     # time startup, search and drawing on this machine's data (offline)
 ```
 
 Lints are set in `Cargo.toml` under `[lints]`: clippy's `all` and `pedantic` groups as warnings, with a short list of pedantic lints turned off (each with its reason), plus `unsafe_code = "forbid"`.

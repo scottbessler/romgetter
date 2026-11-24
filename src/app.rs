@@ -195,12 +195,20 @@ pub enum SearchRow {
     Game(Vec<usize>),
 }
 
+/// A file name parsed for grouping search results (cached: parsing is most of a keystroke).
+struct NameInfo {
+    /// Same game, same key (see `names::GameName::key`).
+    key: String,
+    display: String,
+    preference: (u8, u8, std::cmp::Reverse<(u32, String)>),
+}
+
 /// One set's files prepared for instant search (built once, not per keystroke).
 pub struct SetHay {
     /// "title item", lowercase
     set_text: String,
-    /// per file: lowercase name (+ MAME title), its system, its MAME title
-    files: Vec<(String, &'static str, Option<String>)>,
+    /// per file: lowercase name (+ MAME title), its system, the system's lowercase label, its MAME title
+    files: Vec<(String, &'static str, &'static str, Option<String>)>,
 }
 
 pub enum Row {
@@ -341,6 +349,10 @@ pub enum Msg {
     TexCatalog(anyhow::Result<crate::textures::Catalog>),
     /// A texture pack's download/install moved along (pack key, state).
     Tex(String, crate::textures::TexState),
+    /// A set's search text, built in the background (set, the index it's from, MAME titles generation).
+    Hay(String, Arc<ItemIndex>, u64, SetHay),
+    /// The search-text worker finished its batch.
+    HaysDone,
     /// Config tab: who an API key belongs to, or why the service refused it.
     KeyChecked(Field, anyhow::Result<String>),
     /// Config tab: archive.org login came back.
@@ -414,6 +426,14 @@ const UNCACHED_MAX: u64 = 25_000_000_000;
 
 /// How long TorBox's cache status for Minerva torrents is trusted before re-checking.
 const CACHE_STATUS_REFRESH: Duration = Duration::from_hours(24);
+
+/// Which files of a Minerva set search shows without Real-Debrid (see `App::minerva_keep`).
+enum MinervaKeep<'a> {
+    All,
+    None,
+    /// Those TorBox has cached (lowercase file names).
+    Cached(&'a HashSet<String>),
+}
 
 /// What TorBox has of one Minerva torrent. `None` in the files = every file.
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
@@ -516,6 +536,32 @@ fn matches_all(hay: &str, terms: &[String]) -> bool {
     terms.iter().all(|t| h.contains(t))
 }
 
+/// Search text for one set's files.
+fn build_hay(s: &SetRef, idx: &ItemIndex, mame_titles: &HashMap<String, String>) -> SetHay {
+    let set_system = if s.system.is_empty() { idx.system.clone().unwrap_or_default() } else { s.system.clone() };
+    let set_system = systems::folder_static(&set_system);
+    let files = idx
+        .files
+        .iter()
+        .map(|f| {
+            // File's own extension / folders first, then the set's system.
+            let system = systems::folder_static(file_system(f, set_system));
+            let title = if crate::mame::is_mame_system(system) {
+                crate::mame::short_name(&f.name).and_then(|n| mame_titles.get(&n).cloned())
+            } else {
+                f.title.clone()
+            };
+            let mut text = f.name.to_lowercase();
+            if let Some(t) = &title {
+                text.push(' ');
+                text.push_str(&t.to_lowercase());
+            }
+            (text, system, systems::label_lower(system), title)
+        })
+        .collect();
+    SetHay { set_text: format!("{} {}", idx.title, s.item).to_lowercase(), files }
+}
+
 pub struct App {
     pub tab: Tab,
     pub editing: bool,
@@ -524,7 +570,7 @@ pub struct App {
 
     // sets for search
     pub sets: Vec<SetRef>,
-    pub index: HashMap<String, ItemIndex>,
+    pub index: HashMap<String, Arc<ItemIndex>>,
     pub indexing: HashSet<String>,
     index_permits: Arc<Semaphore>,
     minerva_pending: usize,
@@ -586,13 +632,21 @@ pub struct App {
     /// PS3 games on disk that RPCS3 can't run yet (zip to unpack, or no `.dkey`).
     pub needs_key: HashSet<String>,
     /// MAME short name → full title ("sf2" → "Street Fighter II …").
-    pub mame_titles: HashMap<String, String>,
+    pub mame_titles: Arc<HashMap<String, String>>,
     /// Minerva torrents whose TorBox copy turned out unreadable (btih → when; unix secs).
     broken_torbox: HashMap<String, u64>,
     /// `X` pressed once on this game: a second `X` (within 5 s) deletes its files.
     confirm_delete: Option<(String, Instant)>,
     /// Search text per indexed set; dropped when the set's index or the MAME titles change.
     hay: HashMap<String, SetHay>,
+    /// A background worker is building search text (see `start_hays`).
+    hay_worker: bool,
+    /// Parsed file names by "system\0name" (see `merge_hits`).
+    names: HashMap<String, Arc<NameInfo>>,
+    /// Search text arrived since the worker started: refresh the results when it's done.
+    hay_fresh: bool,
+    /// Bumped when the MAME titles change: search text built before is stale for MAME sets.
+    mame_gen: u64,
     mame_pending: bool,
     /// "system/file name" (lowercase) of everything on disk, for marking search results.
     pub on_disk: HashSet<String>,
@@ -720,10 +774,14 @@ impl App {
             local: HashMap::new(),
             present: HashSet::new(),
             needs_key: HashSet::new(),
-            mame_titles: HashMap::new(),
+            mame_titles: Arc::default(),
             broken_torbox: HashMap::new(),
             confirm_delete: None,
             hay: HashMap::new(),
+            hay_worker: false,
+            names: HashMap::new(),
+            hay_fresh: false,
+            mame_gen: 0,
             mame_pending: false,
             on_disk: HashSet::new(),
             disk_size: HashMap::new(),
@@ -756,7 +814,7 @@ impl App {
             match archive::load_cached(&app.cache_dir, &item) {
                 Some(idx) => {
                     let stale = idx.age() > REINDEX_AFTER;
-                    app.index.insert(item.clone(), idx);
+                    app.index.insert(item.clone(), Arc::new(idx));
                     if stale {
                         app.start_index(item);
                     }
@@ -776,7 +834,7 @@ impl App {
             .collect();
         for item in extra {
             if let Some(idx) = archive::load_cached(&app.cache_dir, &item) {
-                app.index.insert(item, idx);
+                app.index.insert(item, Arc::new(idx));
             }
         }
 
@@ -945,7 +1003,7 @@ impl App {
             self.live_due = None;
             self.start_live_search();
         }
-        self.build_hays(Some(Duration::from_millis(15))); // so the first keystroke doesn't stall
+        self.start_hays();
         self.auto_send();
         self.poll_torbox();
         self.poll_rd();
@@ -1382,6 +1440,20 @@ impl App {
         }
     }
 
+    /// `minerva_available` for every file of one set at once.
+    fn minerva_keep<'a>(&'a self, idx: &ItemIndex) -> MinervaKeep<'a> {
+        let Some(h) = idx.btih.as_deref().filter(|_| self.ctx.rd.is_none()) else { return MinervaKeep::All };
+        if self.broken_torbox.contains_key(&h.to_lowercase()) {
+            return MinervaKeep::None;
+        }
+        match self.minerva_cache.get(h) {
+            Some(TorrentCache { files: Some(files) }) if idx.files.iter().map(|f| f.size).sum::<u64>() > UNCACHED_MAX => {
+                MinervaKeep::Cached(files)
+            }
+            _ => MinervaKeep::All,
+        }
+    }
+
     /// A Minerva folder torrent small enough to download uncached.
     fn minerva_small(&self, btih: &str) -> bool {
         self.index
@@ -1575,7 +1647,7 @@ impl App {
                         self.index_errors.remove(&item);
                         let _ = archive::save_cached(&self.cache_dir, &item, &idx);
                         self.hay.remove(&item);
-                        self.index.insert(item, idx);
+                        self.index.insert(item, Arc::new(idx));
                         if self.indexing.is_empty() {
                             self.status = format!("search ready: {} files across {} sets", self.total_files(), self.indexed_sets());
                             self.check_minerva_cache();
@@ -1704,9 +1776,14 @@ impl App {
                 self.mame_pending = false;
                 match res {
                     Ok(t) => {
-                        self.mame_titles = t;
-                        self.hay.clear();
-                        self.refresh_local();
+                        self.mame_titles = Arc::new(t);
+                        self.mame_gen += 1;
+                        // only MAME sets show titles; the rest keep their search text
+                        let mame: Vec<String> =
+                            self.sets.iter().filter(|s| crate::mame::is_mame_system(&s.system)).map(|s| s.item.clone()).collect();
+                        for item in mame {
+                            self.hay.remove(&item);
+                        }
                     }
                     Err(e) => self.status = format!("MAME titles: {e:#} (search MAME by short name, e.g. sf2)"),
                 }
@@ -1812,7 +1889,7 @@ impl App {
                         // Remember restricted sets, so their games download directly.
                         for (h, idx) in items.iter().filter(|(_, i)| i.restricted) {
                             let _ = archive::save_cached(&self.cache_dir, &h.identifier, idx);
-                            self.index.entry(h.identifier.clone()).or_insert_with(|| idx.clone());
+                            self.index.entry(h.identifier.clone()).or_insert_with(|| Arc::new(idx.clone()));
                         }
                         self.live_hits = self.live_to_hits(items);
                         self.merge_hits();
@@ -1970,6 +2047,13 @@ impl App {
             }
             Msg::TexCatalog(r) => self.on_tex_catalog(r),
             Msg::Tex(key, state) => self.on_tex(key, state),
+            Msg::Hay(item, idx, made, hay) => self.on_hay(item, &idx, made, hay),
+            Msg::HaysDone => {
+                self.hay_worker = false;
+                if std::mem::take(&mut self.hay_fresh) && !self.rom_query.trim().is_empty() {
+                    self.refresh_local();
+                }
+            }
             Msg::KeyChecked(field, res) => self.on_key_checked(field, res),
             Msg::ArchiveLogin(res) => self.on_archive_login(res),
             Msg::Local(id, state) => match state {
@@ -2013,72 +2097,144 @@ impl App {
 
     /// Instant search over the indexed sets. Matches the file name, the set's title,
     /// and the system (e.g. "zelda gba", "god of war ps3", "sony crash", "redump europe").
-    fn build_hay(&self, s: &SetRef, idx: &ItemIndex) -> SetHay {
-        let set_system = if s.system.is_empty() { idx.system.clone().unwrap_or_default() } else { s.system.clone() };
-        let set_system = systems::folder_static(&set_system);
-        let files = idx
-            .files
-            .iter()
-            .map(|f| {
-                // File's own extension / folders first, then the set's system.
-                let system = systems::folder_static(file_system(f, set_system));
-                let title = if crate::mame::is_mame_system(system) {
-                    crate::mame::short_name(&f.name).and_then(|n| self.mame_titles.get(&n).cloned())
-                } else {
-                    f.title.clone()
-                };
-                let mut text = f.name.to_lowercase();
-                if let Some(t) = &title {
-                    text.push(' ');
-                    text.push_str(&t.to_lowercase());
-                }
-                (text, system, title)
+    /// Sets that are searchable but have no search text yet.
+    fn hays_missing(&self) -> Vec<usize> {
+        (0..self.sets.len())
+            .filter(|&i| {
+                let item = &self.sets[i].item;
+                !self.hay.contains_key(item) && self.index.get(item).is_some_and(|x| !self.hidden(x))
             })
-            .collect();
-        SetHay { set_text: format!("{} {}", idx.title, s.item).to_lowercase(), files }
+            .collect()
     }
 
-    /// Prepare search text for sets that lack it, stopping after `budget` (None = all).
-    fn build_hays(&mut self, budget: Option<Duration>) {
-        let start = Instant::now();
-        for i in 0..self.sets.len() {
-            if budget.is_some_and(|b| start.elapsed() >= b) {
-                return;
+    /// Build the missing search text on a background thread (big sets take a while: the UI
+    /// mustn't wait). Search skips sets without it and refreshes as it arrives.
+    fn start_hays(&mut self) {
+        if self.hay_worker {
+            return;
+        }
+        let jobs: Vec<(SetRef, Arc<ItemIndex>)> =
+            self.hays_missing().into_iter().map(|i| (self.sets[i].clone(), self.index[&self.sets[i].item].clone())).collect();
+        if jobs.is_empty() {
+            return;
+        }
+        self.hay_worker = true;
+        let (titles, made, tx) = (self.mame_titles.clone(), self.mame_gen, self.tx.clone());
+        tokio::task::spawn_blocking(move || {
+            for (s, idx) in jobs {
+                let hay = build_hay(&s, &idx, &titles);
+                if tx.send(Msg::Hay(s.item, idx, made, hay)).is_err() {
+                    return;
+                }
             }
-            let item = &self.sets[i].item;
-            if self.hay.contains_key(item) || self.index.get(item).is_none_or(|x| self.hidden(x)) {
-                continue;
-            }
-            let h = self.build_hay(&self.sets[i], &self.index[item]);
+            let _ = tx.send(Msg::HaysDone);
+        });
+    }
+
+    fn on_hay(&mut self, item: String, idx: &Arc<ItemIndex>, made: u64, hay: SetHay) {
+        let current = self.index.get(&item).is_some_and(|i| Arc::ptr_eq(i, idx));
+        let stale_titles = made != self.mame_gen && self.sets.iter().any(|s| s.item == item && crate::mame::is_mame_system(&s.system));
+        if current && !stale_titles {
+            self.hay.insert(item, hay);
+            self.hay_fresh = true;
+        }
+    }
+
+    /// Build every missing set's search text now, on this thread (headless commands, tests).
+    pub fn build_hays_now(&mut self) {
+        for i in self.hays_missing() {
+            let h = build_hay(&self.sets[i], &self.index[&self.sets[i].item], &self.mame_titles);
             self.hay.insert(self.sets[i].item.clone(), h);
         }
+    }
+
+    #[cfg(test)]
+    fn put_index(&mut self, item: String, idx: ItemIndex) {
+        self.hay.remove(&item);
+        self.index.insert(item, Arc::new(idx));
+        self.build_hays_now();
+    }
+
+    /// Sets Search can't look through yet (their search text is being built).
+    pub fn hays_pending(&self) -> usize {
+        self.hays_missing().len()
     }
 
     pub fn refresh_local(&mut self) {
         let q = self.query();
         self.local_hits.clear();
         if !q.is_empty() {
-            self.build_hays(None);
-            'outer: for s in &self.sets {
-                let Some(idx) = self.index.get(&s.item) else { continue };
-                if self.hidden(idx) || !self.cfg.source_on(&s.item) {
-                    continue;
+            // Which files match, set by set, on every core (the scan is most of a keystroke);
+            // then the hits in set order, here.
+            let sets: Vec<(&SetRef, &ItemIndex, &SetHay)> = self
+                .sets
+                .iter()
+                .filter(|s| self.cfg.source_on(&s.item))
+                .filter_map(|s| {
+                    let idx = self.index.get(&s.item).filter(|x| !self.hidden(x))?;
+                    Some((s, &**idx, self.hay.get(&s.item)?))
+                })
+                .collect();
+            let threads = std::thread::available_parallelism().map_or(1, std::num::NonZero::get).min(8);
+            let next = std::sync::atomic::AtomicUsize::new(0);
+            // Hits in finished sets: sets are claimed in order, so once there are enough,
+            // sets not started yet can't make the first MAX_LOCAL_HITS.
+            let total = std::sync::atomic::AtomicUsize::new(0);
+            let this = &*self;
+            let mut found: Vec<Vec<u32>> = vec![Vec::new(); sets.len()];
+            std::thread::scope(|scope| {
+                let (q, sets, next, total) = (&q, &sets, &next, &total);
+                let handles: Vec<_> = (0..threads)
+                    .map(|_| {
+                        scope.spawn(move || {
+                            let mut out = Vec::new();
+                            loop {
+                                if total.load(std::sync::atomic::Ordering::Relaxed) >= MAX_LOCAL_HITS {
+                                    return out;
+                                }
+                                let n = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                let Some((_, idx, hay)) = sets.get(n) else { return out };
+                                let sq = q.for_set(&hay.set_text);
+                                // not on TorBox: let another source's copy show instead
+                                let keep = this.minerva_keep(idx);
+                                let gone = |i: usize| match keep {
+                                    MinervaKeep::All => false,
+                                    MinervaKeep::None => true,
+                                    MinervaKeep::Cached(files) => {
+                                        let name = &idx.files[i].name;
+                                        !files.contains(&name.rsplit('/').next().unwrap_or(name).to_lowercase())
+                                    }
+                                };
+                                let files: Vec<u32> = hay
+                                    .files
+                                    .iter()
+                                    .enumerate()
+                                    .filter(|(i, (text, system, label, _))| sq.matches(text, label, system) && !gone(*i))
+                                    .map(|(i, _)| i as u32)
+                                    .take(MAX_LOCAL_HITS)
+                                    .collect();
+                                total.fetch_add(files.len(), std::sync::atomic::Ordering::Relaxed);
+                                out.push((n, files));
+                            }
+                        })
+                    })
+                    .collect();
+                for h in handles {
+                    for (n, files) in h.join().unwrap_or_default() {
+                        found[n] = files;
+                    }
                 }
-                let Some(hay) = self.hay.get(&s.item) else { continue };
-                for (f, (text, system, title)) in idx.files.iter().zip(&hay.files) {
-                    if !q.matches_any(&[text, &hay.set_text], system) {
-                        continue;
-                    }
-                    let (system, title) = (*system, title.clone());
-                    if self.ctx.rd.is_none() && idx.btih.as_deref().is_some_and(|h| !self.minerva_available(h, &f.name)) {
-                        continue; // not on TorBox: let another source's copy show instead
-                    }
+            });
+            let mut hits = Vec::new();
+            'outer: for ((s, idx, hay), files) in sets.iter().zip(found) {
+                for i in files {
+                    let (f, (_, system, _, title)) = (&idx.files[i as usize], &hay.files[i as usize]);
                     let source = if idx.title.is_empty() { s.item.clone() } else { idx.title.clone() };
                     let (url, torrent) = match &idx.btih {
                         Some(h) => (format!("minerva:{h}/{}", f.name), Some((h.clone(), f.torrent_index))),
                         None => (f.url(&s.item), None),
                     };
-                    self.local_hits.push(RomHit {
+                    hits.push(RomHit {
                         url,
                         name: f.name.clone(),
                         size: f.size,
@@ -2086,13 +2242,14 @@ impl App {
                         source,
                         live: false,
                         torrent,
-                        title,
+                        title: title.clone(),
                     });
-                    if self.local_hits.len() >= MAX_LOCAL_HITS {
+                    if hits.len() >= MAX_LOCAL_HITS {
                         break 'outer;
                     }
                 }
             }
+            self.local_hits = hits;
         }
         self.merge_hits();
     }
@@ -2178,26 +2335,41 @@ impl App {
             .cloned()
             .collect();
         // Same game from several sources shows once, best source first.
-        let parsed: Vec<crate::names::GameName> = hits.iter().map(|h| crate::names::parse(&h.system, &h.name)).collect();
-        let mut groups: HashMap<String, Vec<usize>> = HashMap::new();
-        for (i, h) in hits.iter().enumerate() {
-            groups.entry(parsed[i].key(&h.system)).or_default().push(i);
+        if self.names.len() > 100_000 {
+            self.names.clear();
+        }
+        let names = &mut self.names;
+        let parsed: Vec<Arc<NameInfo>> = hits
+            .iter()
+            .map(|h| {
+                names
+                    .entry(format!("{}\0{}", h.system, h.name))
+                    .or_insert_with(|| {
+                        let g = crate::names::parse(&h.system, &h.name);
+                        Arc::new(NameInfo { key: g.key(&h.system), display: g.display(), preference: crate::names::preference(&h.name) })
+                    })
+                    .clone()
+            })
+            .collect();
+        let mut groups: HashMap<&str, Vec<usize>> = HashMap::new();
+        for (i, p) in parsed.iter().enumerate() {
+            groups.entry(&p.key).or_default().push(i);
         }
         let base = |h: &RomHit| h.name.rsplit('/').next().unwrap_or(&h.name).to_string();
-        let mut games: Vec<(String, Vec<usize>)> = groups.into_iter().collect();
+        let mut games: Vec<(String, Vec<usize>)> = groups.into_iter().map(|(k, g)| (k.to_string(), g)).collect();
         for (_, g) in &mut games {
             // cached on TorBox first, then the best version (finished game, USA, latest rev),
             // then the best source of it
             g.sort_by_cached_key(|&i| {
                 let rank = self.source_rank(&hits[i]);
-                (rank != 0, crate::names::preference(&hits[i].name), rank, base(&hits[i]).len())
+                (rank != 0, parsed[i].preference.clone(), rank, base(&hits[i]).len())
             });
         }
         // Grouped by system (Library order, undetected last), then alphabetical by name.
         let order = |s: &str| systems::SYSTEMS.iter().position(|(f, _)| *f == s).unwrap_or(usize::MAX);
         games.sort_by_cached_key(|(_, g)| {
             let h = &hits[g[0]];
-            let name = h.title.clone().unwrap_or_else(|| parsed[g[0]].display());
+            let name = h.title.clone().unwrap_or_else(|| parsed[g[0]].display.clone());
             (order(&h.system), h.system.clone(), name.to_lowercase())
         });
         let (mut rows, mut keys) = (Vec::new(), Vec::new());
@@ -3724,9 +3896,9 @@ mod tests {
         ] {
             app.sets.push(SetRef { item, system: sys.into() });
         }
-        app.index.insert(minerva::set_key("Redump", "Sony - PlayStation"), idx(3, false));
-        app.index.insert("nointro.md".into(), idx(2, false));
-        app.index.insert("microsoft_xbox360_a_part1".into(), idx(5, true));
+        app.put_index(minerva::set_key("Redump", "Sony - PlayStation"), idx(3, false));
+        app.put_index("nointro.md".into(), idx(2, false));
+        app.put_index("microsoft_xbox360_a_part1".into(), idx(5, true));
         app.index_errors.insert(minerva::set_key("No-Intro", "Nintendo - Game Boy"), "HTTP 500".into());
         app.tab = Tab::Sources;
         app.editing = false;
@@ -3784,7 +3956,7 @@ mod tests {
         let file = |n: &str| archive::RomFile { name: n.into(), size: 1, url: None, torrent_index: None, title: None, system: None };
         for (item, game) in [("set.a", "Crash Bandicoot (USA).zip"), ("set.b", "Crash Bandicoot (Europe).zip")] {
             app.sets.push(SetRef { item: item.into(), system: "psx".into() });
-            app.index.insert(
+            app.put_index(
                 item.into(),
                 ItemIndex { restricted: false, files: vec![file(game)], system: None, title: item.into(), fetched: 0, btih: None },
             );
@@ -3841,7 +4013,7 @@ mod tests {
             [(&small, set("AA", 5 << 30)), (&huge, set("bb", 2 * CACHE_MAX)), (&held, set("cc", 1 << 20)), (&tbset, set("dd", 1 << 30))]
         {
             app.sets.push(SetRef { item: k.clone(), system: "psx".into() });
-            app.index.insert(k.clone(), i);
+            app.put_index(k.clone(), i);
         }
         app.tb_held.insert("cc".into(), None);
         assert_eq!(app.cache_targets(&small), vec![Debrid::TorBox, Debrid::RealDebrid]);
@@ -4014,7 +4186,7 @@ mod tests {
         let file =
             |n: &str| archive::RomFile { name: n.into(), size: 14 << 30, url: None, torrent_index: Some(1), title: None, system: None };
         app.sets.push(SetRef { item: minerva::set_key("Redump", "Sony - PlayStation 3"), system: "ps3".into() });
-        app.index.insert(
+        app.put_index(
             minerva::set_key("Redump", "Sony - PlayStation 3"),
             ItemIndex {
                 restricted: false,
@@ -4037,7 +4209,7 @@ mod tests {
         assert_eq!(app.local_hits.len(), 2, "fully cached: show everything");
         // a small folder TorBox hasn't cached at all can still be downloaded whole
         app.minerva_cache.insert(h.clone(), TorrentCache { files: Some(HashSet::new()) });
-        for f in &mut app.index.get_mut(&minerva::set_key("Redump", "Sony - PlayStation 3")).unwrap().files {
+        for f in &mut Arc::make_mut(app.index.get_mut(&minerva::set_key("Redump", "Sony - PlayStation 3")).unwrap()).files {
             f.size = 1 << 20;
         }
         assert!(app.minerva_available(&h, "Armored Core 4 (USA).zip"));
@@ -4047,7 +4219,7 @@ mod tests {
     async fn routes_uncached_minerva_games_to_real_debrid() {
         let mut app = test_app(Vec::new());
         let h = "626a5e05f498e435145c97352aa2fecf7e95a668".to_string();
-        app.index.insert(
+        app.put_index(
             minerva::set_key("Redump", "Sony - PlayStation 3"),
             ItemIndex {
                 restricted: false,
@@ -4082,7 +4254,7 @@ mod tests {
         let mut app = test_app(Vec::new());
         let file = |n: &str| archive::RomFile { name: n.into(), size: 1, url: None, torrent_index: None, title: None, system: None };
         app.sets.push(SetRef { item: "x360".into(), system: "xbox360".into() });
-        app.index.insert(
+        app.put_index(
             "x360".into(),
             ItemIndex {
                 restricted: false,
@@ -4264,7 +4436,7 @@ mod tests {
     async fn refuses_whole_minerva_folder_magnets() {
         let mut app = test_app(Vec::new());
         let h = "626a5e05f498e435145c97352aa2fecf7e95a668";
-        app.index.insert(
+        app.put_index(
             minerva::set_key("Redump", "Sony - PlayStation 3"),
             ItemIndex {
                 restricted: false,
