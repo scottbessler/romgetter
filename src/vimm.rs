@@ -129,6 +129,20 @@ fn decode(s: &str) -> String {
 /// command; the URL is appended. Otherwise: Firefox or Chrome (Flatpak, as on a Steam
 /// Deck), then the desktop's default. Steam's built-in browser can't save files, which is
 /// what `xdg-open` reaches from Game Mode, so a real browser goes first.
+/// Browsers that draw in the terminal: they need romgetter's screen while they run.
+const TERMINAL_BROWSERS: &[&str] = &["terminal-browser", "carbonyl", "browsh", "w3m", "lynx", "links", "elinks", "cha", "chawan"];
+
+/// The configured browser command with the URL added, if it's a terminal browser
+/// (e.g. "terminal-browser open"): it must run in the foreground, in romgetter's terminal.
+pub fn terminal_browser(url: &str, custom: Option<&str>) -> Option<Vec<String>> {
+    let mut cmd: Vec<String> = custom?.split_whitespace().map(String::from).collect();
+    let prog = cmd.first()?.rsplit('/').next()?;
+    TERMINAL_BROWSERS.contains(&prog).then(|| {
+        cmd.push(url.to_string());
+        cmd
+    })
+}
+
 pub fn open_in_browser(url: &str, custom: Option<&str>) -> Result<String> {
     let mut candidates: Vec<Vec<String>> = Vec::new();
     if let Some(cmd) = custom.filter(|c| !c.trim().is_empty()) {
@@ -379,6 +393,18 @@ pub fn extract_7z(src: &Path, dir: &Path, progress: &dyn Fn(u64, u64)) -> Result
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn terminal_browsers_run_in_the_foreground() {
+        let url = "https://vimm.net/vault/1";
+        assert_eq!(
+            terminal_browser(url, Some("terminal-browser open")),
+            Some(vec!["terminal-browser".to_string(), "open".into(), url.into()])
+        );
+        assert!(terminal_browser(url, Some("/home/deck/.local/bin/w3m")).is_some());
+        assert_eq!(terminal_browser(url, Some("flatpak run org.mozilla.firefox")), None);
+        assert_eq!(terminal_browser(url, None), None);
+    }
     use super::*;
 
     const ROWS: &str = r#"<table><tr><td style="width:80px; text-align:center">SNES</td><td style="width:auto"><img src="/images/icons/cart.svg" class="media-icon" title="Cartridge"><a href="/vault/1127" onmouseover="buildTooltip(this, 1127, 256, 222)">Chrono Trigger</a>&nbsp; <a href="/manual/4301"><img src="/images/manual_1.gif" title="Read the manual"></a></td><td style="width:65px; text-align:center"><div><img src="/images/flags/usa.png" class="flag" title="USA"></div></td><td>1.0</td></tr>

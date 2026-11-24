@@ -681,6 +681,9 @@ pub struct App {
     pub cfg_tab: CfgTab,
     /// Quit and start again (settings that only apply at startup changed).
     pub restart: bool,
+    /// A command for the main loop to run in the terminal, with the TUI put away until it
+    /// exits (a terminal browser: `browser = "terminal-browser open"`).
+    pub foreground: Option<Vec<String>>,
     tx: UnboundedSender<Msg>,
     local_tx: LocalTx,
     ctx: jobs::Ctx,
@@ -803,6 +806,7 @@ impl App {
             config_file: None,
             cfg_tab: CfgTab::default(),
             restart: false,
+            foreground: None,
             tx,
             local_tx,
             ctx,
@@ -1025,7 +1029,7 @@ impl App {
             self.status = "pick a system first".into();
             return;
         }
-        match vimm::open_in_browser(&g.source, self.cfg.browser.as_deref()) {
+        match self.open_url(&g.source) {
             Ok(browser) => {
                 self.vimm_waiting.insert(g.id.clone(), std::time::SystemTime::now());
                 self.status = format!(
@@ -1036,6 +1040,31 @@ impl App {
             }
             Err(e) => self.status = format!("{e:#} · set `browser` in the config, or open {} yourself", g.source),
         }
+    }
+
+    /// Open a page in the configured browser. A terminal browser takes over the screen
+    /// until it's closed (the main loop runs it: see `foreground`).
+    pub(crate) fn open_url(&mut self, url: &str) -> anyhow::Result<String> {
+        if let Some(cmd) = vimm::terminal_browser(url, self.cfg.browser.as_deref()) {
+            let name = cmd[0].rsplit('/').next().unwrap_or(&cmd[0]).to_string();
+            self.foreground = Some(cmd);
+            return Ok(name);
+        }
+        vimm::open_in_browser(url, self.cfg.browser.as_deref())
+    }
+
+    /// The main loop ran a terminal browser (`foreground`) and has the screen back.
+    pub fn foreground_done(&mut self, program: &str, res: std::io::Result<std::process::ExitStatus>) {
+        let back = match res {
+            Ok(st) if st.success() => format!("back from {program}"),
+            Ok(st) => format!("{program} exited with {st}"),
+            Err(e) => format!("couldn't start {program}: {e} · check `browser` on the Config tab"),
+        };
+        self.status = if self.vimm_waiting.is_empty() {
+            back
+        } else {
+            format!("{back} · watching {} for the download", self.downloads_dir.display())
+        };
     }
 
     /// Every 2 s while Vimm games are waiting: look for finished downloads in the
@@ -4134,6 +4163,19 @@ mod tests {
         app.sets_cursor = Some(format!("\u{1}{}", SET_GROUPS[6]));
         app.press(KeyCode::Char(' '));
         assert!(app.cfg.source_on(ifarchive::KEY));
+    }
+
+    #[tokio::test]
+    async fn terminal_browser_takes_the_screen() {
+        let mut app = test_app(Vec::new());
+        app.cfg.browser = Some("terminal-browser open".into());
+        let g = Game::new("Ape Escape".into(), "psx".into(), SourceKind::Vimm, "https://vimm.net/vault/123".into(), 1);
+        app.open_vimm(&g);
+        assert_eq!(app.foreground.as_deref(), Some(&["terminal-browser".to_string(), "open".into(), g.source.clone()][..]));
+        assert!(app.vimm_waiting.contains_key(&g.id), "its download is watched for");
+        app.foreground = None;
+        app.foreground_done("terminal-browser", Ok(std::process::ExitStatus::default()));
+        assert!(app.status.starts_with("back from terminal-browser · watching"), "{}", app.status);
     }
 
     fn test_app(games: Vec<Game>) -> App {

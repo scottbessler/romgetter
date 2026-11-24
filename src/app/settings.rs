@@ -80,7 +80,9 @@ impl CfgEdit {
             (Field::Archive, Some(e)) => format!("archive.org password for {e} (not kept)"),
             (Field::RomsDir, _) => "RetroDECK roms folder (holds snes/, psx/, …)".into(),
             (Field::DownloadsDir, _) => "Browser downloads folder (empty: ~/Downloads)".into(),
-            (Field::Browser, _) => "Browser command for Vimm pages, the URL is added (empty: Firefox/Chrome)".into(),
+            (Field::Browser, _) => {
+                "Browser command for Vimm pages, the URL is added (empty: Firefox/Chrome; e.g. terminal-browser open)".into()
+            }
             (Field::Poll, _) => "Seconds between TorBox checks while games download".into(),
             (Field::AddSet, _) => "archive.org identifier or URL of a set to search".into(),
             _ => String::new(),

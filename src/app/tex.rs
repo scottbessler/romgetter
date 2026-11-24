@@ -283,7 +283,7 @@ impl App {
     }
 
     fn tex_browse(&mut self, url: &str) {
-        self.status = match crate::vimm::open_in_browser(url, self.cfg.browser.as_deref()) {
+        self.status = match self.open_url(url) {
             Ok(b) => format!("opened in {b}: {url}"),
             Err(e) => format!("{e:#} · open {url} yourself"),
         };

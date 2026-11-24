@@ -303,6 +303,17 @@ async fn main() -> Result<()> {
                 app.pad = connected;
                 pad_was_connected = connected;
             }
+            if let Some(cmd) = app.foreground.take() {
+                // A terminal browser: give it the screen and keyboard until it quits.
+                let _ = execute!(std::io::stdout(), DisableBracketedPaste);
+                ratatui::restore();
+                let res = tokio::task::block_in_place(|| std::process::Command::new(&cmd[0]).args(&cmd[1..]).status());
+                terminal = ratatui::init();
+                let _ = execute!(std::io::stdout(), EnableBracketedPaste);
+                terminal.clear()?;
+                while pad.poll().is_some() {} // presses meant for the browser
+                app.foreground_done(cmd[0].rsplit('/').next().unwrap_or(&cmd[0]), res);
+            }
             app.tick();
             terminal.draw(|f| ui::draw(f, &mut app))?;
             // Blocking poll is fine: the multi-threaded runtime keeps background tasks going.
