@@ -226,6 +226,20 @@ impl TorBox {
         Ok(serde_json::from_value(obj)?)
     }
 
+    /// Who the key belongs to ("email · plan"): checks a key typed into the Config tab.
+    pub async fn whoami(&self) -> Result<String> {
+        let data = self.call(self.http.get(format!("{BASE}/user/me")).bearer_auth(&self.key)).await?;
+        let email = data.get("email").and_then(Value::as_str).unwrap_or("?");
+        let plan = match data.get("plan").and_then(Value::as_u64) {
+            Some(0) => "free",
+            Some(1) => "essential",
+            Some(2) => "pro",
+            Some(3) => "standard",
+            _ => "plan ?",
+        };
+        Ok(format!("{email} · {plan}"))
+    }
+
     /// All items of one kind in the account (used for polling). TorBox pages the list
     /// newest first, 1000 at a time.
     pub async fn list(&self, kind: Kind) -> Result<Vec<Item>> {
@@ -364,5 +378,15 @@ mod tests {
         assert!(zipped.is_zipped());
         assert!(item.download_present);
         assert_eq!(item.files[0].file_name(), "x.zip");
+    }
+
+    #[tokio::test]
+    #[ignore = "network; needs the key in the config"]
+    async fn whoami_live() {
+        let paths = crate::config::Paths::new().unwrap();
+        let key = crate::config::Config::load(&paths.config_file).unwrap().api_key().expect("key");
+        let who = TorBox::new(reqwest::Client::new(), key).whoami().await.unwrap();
+        println!("{who}");
+        assert!(!who.starts_with('?'), "{who}");
     }
 }

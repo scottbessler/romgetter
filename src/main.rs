@@ -277,8 +277,35 @@ async fn main() -> Result<()> {
     let _ = execute!(std::io::stdout(), DisableBracketedPaste);
     ratatui::restore();
     res?;
+    if app.restart {
+        return restart();
+    }
     eprintln!("config: {}\nlibrary: {}", paths.config_file.display(), paths.library_file.display());
     Ok(())
+}
+
+/// Start romgetter again in this process, with the same arguments (the Config tab's
+/// "Restart romgetter"). argv[0] first: after a redeploy over the binary, the running
+/// one's /proc/self/exe is "(deleted)".
+fn restart() -> Result<()> {
+    let mut args = std::env::args_os();
+    let argv0 = args.next().filter(|a| a.to_string_lossy().contains('/'));
+    let exe = match argv0 {
+        Some(a) => std::path::PathBuf::from(a),
+        None => std::env::current_exe()?,
+    };
+    let mut cmd = std::process::Command::new(exe);
+    cmd.args(args);
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        Err(anyhow::Error::from(cmd.exec()).context("restarting romgetter"))
+    }
+    #[cfg(not(unix))]
+    {
+        cmd.spawn()?;
+        Ok(())
+    }
 }
 
 /// Read a line from the terminal; `hidden` doesn't echo it (for passwords).

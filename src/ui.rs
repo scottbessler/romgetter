@@ -1,4 +1,6 @@
-use crate::app::{App, LIB_GROUP_LIMIT, LIVE_GROUP, LIVE_SOURCES, LibInput, Menu, Remote, Row, SearchRow, SetRow, SetState, Tab, TexRow};
+use crate::app::{
+    App, CfgRow, LIB_GROUP_LIMIT, LIVE_GROUP, LIVE_SOURCES, LibInput, Menu, Remote, Row, SearchRow, SetRow, SetState, Tab, TexRow,
+};
 use crate::jobs::LocalState;
 use crate::systems;
 use ratatui::Frame;
@@ -49,7 +51,8 @@ pub fn draw(f: &mut Frame, app: &mut App) {
             Tab::Library => format!("{} ({})", t.title(), app.lib.games.len()),
             Tab::Textures if !app.tex.jobs.is_empty() => format!("{} (⇣{})", t.title(), app.tex.jobs.len()),
             Tab::Sources if app.busy() => format!("{} (indexing {})", t.title(), app.sets.len() - app.indexed_sets()),
-            Tab::Search | Tab::Textures | Tab::Sources => t.title().to_string(),
+            Tab::Config if !app.cfg_tab.restart_for.is_empty() => format!("{} (restart)", t.title()),
+            Tab::Search | Tab::Textures | Tab::Sources | Tab::Config => t.title().to_string(),
         }))
         .select(idx)
         .highlight_style(Style::new().fg(Color::Cyan).bold().underlined()),
@@ -61,6 +64,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         Tab::Library => draw_library(f, app, body),
         Tab::Textures => draw_textures(f, app, body),
         Tab::Sources => draw_sources(f, app, body),
+        Tab::Config => draw_config(f, app, body),
     }
 
     f.render_widget(Paragraph::new(app.status.as_str()).fg(Color::Yellow), status);
@@ -79,6 +83,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
                 "Enter download/open · Space actions · m menu · D download all ready · t add Metacritic top 20 · ←→ fold · d direct · p paste · / filter · s search · S system · o sort name/size · x remove · X delete from disk · r rescan · q quit"
             }
             Tab::Sources => "Enter open group / set actions · Space on/off · ←→ fold · m menu · s search · Tab next tab · q quit",
+            Tab::Config => "Enter change / switch · Space actions · m menu · s search · Tab next tab · q quit",
             Tab::Textures => {
                 "Enter install / turn on·off · Space actions (pick a build) · m menu · r refresh the pack lists · Tab next tab · q quit"
             }
@@ -127,6 +132,7 @@ fn pad_help(app: &App) -> &'static str {
         Tab::Library => "[A] download/open · [B] actions · [X] filter · [Y] menu · ←→ fold · LB/RB tabs · LT/RT page",
         Tab::Textures => "[A] install / turn on·off · [B] actions · [Y] menu · LB/RB tabs · LT/RT page",
         Tab::Sources => "[A] open / actions · [B] actions (on/off) · ←→ fold · [Y] menu · LB/RB tabs · LT/RT page",
+        Tab::Config => "[A] change / switch · [B] actions · [Y] menu · LB/RB tabs · LT/RT page",
     }
 }
 
@@ -259,7 +265,7 @@ fn draw_sources(f: &mut Frame, app: &mut App, area: Rect) {
                     SetState::Indexing => ("… indexing", Color::Cyan, String::new()),
                     SetState::Waiting => ("○ waiting", Color::DarkGray, String::new()),
                     SetState::Failed(e) => ("✗ failed", Color::Red, e.chars().take(80).collect()),
-                    SetState::Locked => ("🔒 login", Color::DarkGray, "restricted: romgetter archive-login unlocks it".into()),
+                    SetState::Locked => ("🔒 login", Color::DarkGray, "restricted: log in to archive.org on the Config tab".into()),
                 };
                 let mut spans = vec![
                     Span::raw("  "),
@@ -300,6 +306,66 @@ fn draw_sources(f: &mut Frame, app: &mut App, area: Rect) {
 }
 
 /// (badge, color, detail) for a library game.
+fn draw_config(f: &mut Frame, app: &mut App, area: Rect) {
+    let list_area = match &app.cfg_tab.edit {
+        Some(e) => {
+            let [inp, list] = Layout::vertical([Constraint::Length(3), Constraint::Min(1)]).areas(area);
+            let shown = if e.secret() { "•".repeat(e.text.chars().count()) } else { e.text.clone() };
+            input(f, inp, format!(" {} · Enter save · Esc cancel ", e.prompt()), &shown, app.editing);
+            list
+        }
+        None => area,
+    };
+    let rows = app.cfg_rows();
+    let label_w = rows
+        .iter()
+        .filter_map(|r| match r {
+            CfgRow::Item(i) => Some(i.label.chars().count()),
+            CfgRow::Header(_) => None,
+        })
+        .max()
+        .unwrap_or(0)
+        .min(32);
+    let mut selected = None;
+    let mut n = 0;
+    let items: Vec<ListItem> = rows
+        .iter()
+        .enumerate()
+        .map(|(row, r)| match r {
+            CfgRow::Header(h) => ListItem::new(Span::styled(format!("▾ {h}"), Style::new().fg(Color::Magenta).bold())),
+            CfgRow::Item(i) => {
+                if n == app.cfg_tab.cursor {
+                    selected = Some(row);
+                }
+                n += 1;
+                let value_style = match i.ok {
+                    Some(true) => Style::new().fg(Color::Green),
+                    Some(false) => Style::new().fg(Color::Red),
+                    None => Style::new(),
+                };
+                let note_style = match i.ok {
+                    Some(false) if i.note.starts_with('✗') || i.note.starts_with("applies") => Style::new().fg(Color::Red),
+                    Some(true) if i.note.starts_with('✓') => Style::new().fg(Color::Green),
+                    _ => DIM,
+                };
+                let label: String = i.label.chars().take(label_w).collect();
+                ListItem::new(Line::from(vec![
+                    Span::raw(format!("  {label:<label_w$}  ")),
+                    Span::styled(i.value.clone(), value_style.bold()),
+                    Span::styled(if i.note.is_empty() { String::new() } else { format!("   {}", i.note) }, note_style),
+                ]))
+            }
+        })
+        .collect();
+    if selected.is_none() && n > 0 {
+        app.cfg_tab.cursor = n - 1;
+    }
+    app.cfg_tab.state.select(selected);
+    let file = app.config_file.as_deref().map(crate::app::tilde).unwrap_or_default();
+    let title = format!(" Config · saved to {file} ");
+    f.render_stateful_widget(List::new(items).block(border(title, !app.editing)).highlight_style(HL), list_area, &mut app.cfg_tab.state);
+}
+
 fn game_status(app: &App, id: &str) -> (String, Color, String) {
     if let Some(LocalState::Downloading { file, done, total }) = app.local.get(id) {
         let pct = if *total > 0 { *done as f64 / *total as f64 * 100.0 } else { 0.0 };

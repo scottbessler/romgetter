@@ -148,6 +148,16 @@ impl RealDebrid {
         Ok(text)
     }
 
+    /// Who the key belongs to ("user · premium until 2027-01-01"): checks a key typed into the Config tab.
+    pub async fn whoami(&self) -> Result<String> {
+        let text = self.send(self.http.get(format!("{BASE}/user"))).await?;
+        let v: serde_json::Value = serde_json::from_str(&text)?;
+        let user = v.get("username").and_then(|u| u.as_str()).unwrap_or("?");
+        let kind = v.get("type").and_then(|t| t.as_str()).unwrap_or("?");
+        let until = v.get("expiration").and_then(|e| e.as_str()).map(|e| e.get(..10).unwrap_or(e)).unwrap_or("");
+        Ok(if kind == "premium" && !until.is_empty() { format!("{user} · premium until {until}") } else { format!("{user} · {kind}") })
+    }
+
     pub async fn info(&self, id: &str) -> Result<RdInfo> {
         let text = self.send(self.http.get(format!("{BASE}/torrents/info/{id}"))).await?;
         Ok(serde_json::from_str(&text)?)
@@ -335,5 +345,15 @@ mod tests {
         assert!(!info.is_ready() && !info.is_failed());
         assert_eq!(info.selected().len(), 1);
         assert_eq!(info.selected()[0].base_name(), "Armored Core 4 (USA).zip");
+    }
+
+    #[tokio::test]
+    #[ignore = "network; needs the key in the config"]
+    async fn whoami_live() {
+        let paths = crate::config::Paths::new().unwrap();
+        let key = crate::config::Config::load(&paths.config_file).unwrap().rd_key().expect("key");
+        let who = RealDebrid::new(reqwest::Client::new(), key).whoami().await.unwrap();
+        println!("{who}");
+        assert!(!who.starts_with('?'), "{who}");
     }
 }

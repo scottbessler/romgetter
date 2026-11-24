@@ -18,7 +18,9 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::{Semaphore, mpsc::UnboundedSender};
 
+mod settings;
 mod tex;
+pub use settings::{CfgAct, CfgRow, CfgTab, Field, tilde};
 pub use tex::{TexRow, TexTab};
 
 /// Re-index cached sets older than this (in the background; the cache stays usable).
@@ -42,16 +44,18 @@ pub enum Tab {
     Library,
     Textures,
     Sources,
+    Config,
 }
 
 impl Tab {
-    pub const ALL: [Tab; 4] = [Tab::Search, Tab::Library, Tab::Textures, Tab::Sources];
+    pub const ALL: [Tab; 5] = [Tab::Search, Tab::Library, Tab::Textures, Tab::Sources, Tab::Config];
     pub fn title(self) -> &'static str {
         match self {
             Tab::Search => "1 Search",
             Tab::Library => "2 Library",
             Tab::Textures => "3 Textures",
             Tab::Sources => "4 Sources",
+            Tab::Config => "5 Config",
         }
     }
 }
@@ -62,7 +66,7 @@ pub const SET_GROUPS: &[&str] = &[
     "Minerva · Redump",
     "Your TorBox torrents",
     "archive.org · built-in sets",
-    "archive.org · restricted (romgetter archive-login)",
+    "archive.org · restricted (log in on the Config tab)",
     "archive.org · your extra sets",
     "IF Archive",
     LIVE_GROUP,
@@ -275,6 +279,8 @@ pub enum Act {
     ToggleSource,
     /// Sources tab: have this debrid service cache the whole set torrent.
     CacheTo(Debrid),
+    /// Config tab: do this to the selected setting.
+    Cfg(CfgAct),
     /// Textures tab: install build N of the selected pack.
     TexInstall(usize),
     /// Open build N's page (hosts only a person can use).
@@ -335,6 +341,10 @@ pub enum Msg {
     TexCatalog(anyhow::Result<crate::textures::Catalog>),
     /// A texture pack's download/install moved along (pack key, state).
     Tex(String, crate::textures::TexState),
+    /// Config tab: who an API key belongs to, or why the service refused it.
+    KeyChecked(Field, anyhow::Result<String>),
+    /// Config tab: archive.org login came back.
+    ArchiveLogin(anyhow::Result<crate::config::ArchiveLogin>),
 }
 
 const MINERVA_REFRESH: Duration = Duration::from_hours(168);
@@ -614,6 +624,9 @@ pub struct App {
     pub cache_jobs: HashMap<(Debrid, String), CacheJob>,
     /// Where `cfg` came from, for saving settings changed in the app (None in tests).
     pub config_file: Option<PathBuf>,
+    pub cfg_tab: CfgTab,
+    /// Quit and start again (settings that only apply at startup changed).
+    pub restart: bool,
     tx: UnboundedSender<Msg>,
     local_tx: LocalTx,
     ctx: jobs::Ctx,
@@ -730,11 +743,14 @@ impl App {
             index_errors: HashMap::new(),
             cache_jobs: HashMap::new(),
             config_file: None,
+            cfg_tab: CfgTab::default(),
+            restart: false,
             tx,
             local_tx,
             ctx,
         };
 
+        app.apply_groups_off();
         let items: Vec<String> = app.sets.iter().map(|s| s.item.clone()).collect();
         for item in items {
             match archive::load_cached(&app.cache_dir, &item) {
@@ -806,7 +822,7 @@ impl App {
         app.start_scan();
 
         app.status = if app.ctx.torbox.is_none() {
-            "No TorBox API key: set torbox_api_key in the config or TORBOX_API_KEY. Direct downloads (d) still work.".into()
+            "No TorBox API key: add one on the Config tab (5). Direct downloads (d) still work.".into()
         } else if !app.indexing.is_empty() {
             format!("indexing {} ROM sets in the background (first run only)…", app.indexing.len())
         } else {
@@ -1332,6 +1348,40 @@ impl App {
         }
     }
 
+    /// Sets of groups an old `use_minerva = false` (etc.) left out: switched off in the
+    /// Sources tab instead, unless already switched there.
+    fn apply_groups_off(&mut self) {
+        use crate::config::Group;
+        if self.cfg.groups_off.is_empty() {
+            return;
+        }
+        let builtin: HashSet<String> = sources::default_sets().into_iter().map(|(item, _)| item).collect();
+        let off: Vec<String> = self
+            .sets
+            .iter()
+            .map(|s| &s.item)
+            .filter(|item| !self.cfg.sources.contains_key(*item))
+            .filter(|item| {
+                let group = if minerva::parse_key(item).is_some() {
+                    Group::Minerva
+                } else if tbzips::parse_key(item).is_some() {
+                    Group::TorboxZips
+                } else if *item == ifarchive::KEY {
+                    Group::IfArchive
+                } else if builtin.contains(*item) {
+                    Group::DefaultSets
+                } else {
+                    return false;
+                };
+                self.cfg.groups_off.contains(&group)
+            })
+            .cloned()
+            .collect();
+        for item in off {
+            self.cfg.set_source(&item, false);
+        }
+    }
+
     /// A Minerva folder torrent small enough to download uncached.
     fn minerva_small(&self, btih: &str) -> bool {
         self.index
@@ -1720,6 +1770,7 @@ impl App {
                         tb_zip_sets(&cands).into_iter().filter(|s| !self.sets.iter().any(|x| x.item == s.item)).collect();
                     let pos = tb_zip_pos(&self.sets);
                     self.sets.splice(pos..pos, new);
+                    self.apply_groups_off();
                     let to_index: Vec<String> = cands
                         .iter()
                         .map(tbzips::Candidate::key)
@@ -1743,6 +1794,7 @@ impl App {
                         // keep Minerva ahead of the archive.org sets
                         let pos = self.sets.iter().take_while(|s| s.item.starts_with("minerva:")).count();
                         self.sets.splice(pos..pos, new);
+                        self.apply_groups_off();
                         for item in to_index {
                             self.start_index(item);
                         }
@@ -1918,6 +1970,8 @@ impl App {
             }
             Msg::TexCatalog(r) => self.on_tex_catalog(r),
             Msg::Tex(key, state) => self.on_tex(key, state),
+            Msg::KeyChecked(field, res) => self.on_key_checked(field, res),
+            Msg::ArchiveLogin(res) => self.on_archive_login(res),
             Msg::Local(id, state) => match state {
                 LocalState::Done(files) => {
                     self.local.remove(&id);
@@ -3024,7 +3078,8 @@ impl App {
         match self.tab {
             Tab::Search => &mut self.rom_query,
             Tab::Library if self.lib_input == LibInput::Paste => &mut self.lib_paste,
-            Tab::Library | Tab::Textures | Tab::Sources => &mut self.lib_filter, // Textures/Sources have no text box
+            Tab::Config if self.cfg_tab.edit.is_some() => &mut self.cfg_tab.edit.as_mut().expect("checked").text,
+            Tab::Library | Tab::Textures | Tab::Sources | Tab::Config => &mut self.lib_filter, // no text box
         }
     }
 
@@ -3032,7 +3087,7 @@ impl App {
         match self.tab {
             Tab::Search => self.on_query_change(),
             Tab::Library if self.lib_input == LibInput::Filter => self.fix_cursor(),
-            Tab::Library | Tab::Textures | Tab::Sources => {}
+            Tab::Library | Tab::Textures | Tab::Sources | Tab::Config => {}
         }
     }
 
@@ -3088,7 +3143,7 @@ impl App {
         let code = match p {
             Pad::A => K::Enter,
             Pad::B => K::Char(' '),
-            Pad::X | Pad::View if matches!(self.tab, Tab::Textures | Tab::Sources) => return,
+            Pad::X | Pad::View if matches!(self.tab, Tab::Textures | Tab::Sources | Tab::Config) => return,
             Pad::X | Pad::View => {
                 self.press(K::Char('/'));
                 gamepad::open_steam_keyboard();
@@ -3117,6 +3172,7 @@ impl App {
         match self.tab {
             Tab::Textures => return self.tex_item_menu(),
             Tab::Sources => return self.set_item_menu(),
+            Tab::Config => return self.cfg_item_menu(),
             Tab::Search => {
                 let Some(hits) = self.selected_hits().map(<[usize]>::to_vec) else {
                     let Some(sys) = self.search_cursor_system() else { return };
@@ -3213,6 +3269,12 @@ impl App {
                 items.push(("Close all groups".into(), Act::CollapseAll));
                 "Sources"
             }
+            Tab::Config => {
+                if !self.cfg_tab.restart_for.is_empty() {
+                    items.push(("Restart romgetter (applies the changes)".into(), Act::Cfg(CfgAct::Restart)));
+                }
+                "Config"
+            }
         };
         items.push(("Quit romgetter".into(), Act::Quit));
         self.menu = Some(Menu { title: title.into(), items, sel: 0 });
@@ -3248,7 +3310,7 @@ impl App {
         let sys = match self.tab {
             Tab::Search => self.selected_hit().map(|h| h.system.clone()),
             Tab::Library => self.selected_game().map(|g| g.system.clone()),
-            Tab::Textures | Tab::Sources => None,
+            Tab::Textures | Tab::Sources | Tab::Config => None,
         };
         if let (Some(sys), Some(m)) = (sys, self.menu.as_mut()) {
             m.items[m.sel].0 = system_label(&sys);
@@ -3322,6 +3384,7 @@ impl App {
             Act::Rescan => self.press(KeyCode::Char('r')),
             Act::ToggleSource => self.toggle_source_row(),
             Act::CacheTo(d) => self.cache_selected_set(d),
+            Act::Cfg(a) => self.cfg_run(a),
             Act::TexInstall(_) | Act::TexOpenUrl(_) | Act::TexToggle | Act::TexRemove | Act::TexPage | Act::TexRefresh => self.tex_run(act),
             Act::Quit => self.quit = true,
         }
@@ -3343,6 +3406,7 @@ impl App {
             match k.code {
                 KeyCode::Esc | KeyCode::Down => {
                     self.editing = false;
+                    self.cfg_cancel();
                     if self.tab == Tab::Library && self.lib_input == LibInput::Paste && k.code == KeyCode::Esc {
                         self.lib_paste.clear();
                         self.lib_input = LibInput::Filter;
@@ -3350,6 +3414,7 @@ impl App {
                 }
                 KeyCode::Tab => {
                     self.editing = false;
+                    self.cfg_cancel();
                     self.next_tab(1);
                 }
                 KeyCode::Enter => {
@@ -3362,6 +3427,7 @@ impl App {
                             }
                         }
                         Tab::Library if self.lib_input == LibInput::Paste => self.add_pasted_link(),
+                        Tab::Config => self.cfg_submit(),
                         Tab::Library | Tab::Textures | Tab::Sources => {}
                     }
                 }
@@ -3387,9 +3453,10 @@ impl App {
             KeyCode::Char('2') => self.set_tab(Tab::Library),
             KeyCode::Char('3') => self.set_tab(Tab::Textures),
             KeyCode::Char('4') => self.set_tab(Tab::Sources),
+            KeyCode::Char('5') => self.set_tab(Tab::Config),
             KeyCode::Tab => self.next_tab(1),
             KeyCode::BackTab => self.next_tab(-1),
-            KeyCode::Char('/' | 'i') if matches!(self.tab, Tab::Textures | Tab::Sources) => {}
+            KeyCode::Char('/' | 'i') if matches!(self.tab, Tab::Textures | Tab::Sources | Tab::Config) => {}
             KeyCode::Char('/' | 'i') => {
                 if self.tab == Tab::Library {
                     self.lib_input = LibInput::Filter;
@@ -3417,6 +3484,7 @@ impl App {
                 }
                 (Tab::Textures, KeyCode::Enter) => self.tex_activate(),
                 (Tab::Sources, KeyCode::Enter) => self.activate_set_row(),
+                (Tab::Config, KeyCode::Enter) => self.cfg_activate(),
                 (Tab::Sources, KeyCode::Char(' ')) => self.toggle_source_row(),
                 (Tab::Sources, KeyCode::Left | KeyCode::Right | KeyCode::Char('h' | 'l')) => {
                     if let Some(g) = self.sets_cursor_group() {
@@ -3480,7 +3548,7 @@ impl App {
                     self.rom_hits[i].system.clone_from(&sys);
                 }
             }
-            Tab::Textures | Tab::Sources => {}
+            Tab::Textures | Tab::Sources | Tab::Config => {}
             Tab::Library => {
                 let roms = self.ctx.roms_dir.clone();
                 let Some(id) = self.selected_game().map(|g| g.id.clone()) else { return };
@@ -3510,11 +3578,17 @@ impl App {
         if t == Tab::Textures {
             self.tex_open();
         }
+        if t == Tab::Config {
+            self.cfg_open();
+        }
     }
 
     fn move_sel(&mut self, delta: isize) {
         if self.tab == Tab::Textures {
             return self.tex_move(delta);
+        }
+        if self.tab == Tab::Config {
+            return self.cfg_move(delta);
         }
         if self.tab == Tab::Sources {
             let keys: Vec<String> = self.set_rows().iter().map(Self::set_row_key).collect();
@@ -3678,7 +3752,7 @@ mod tests {
                 "G Minerva · No-Intro 1 0 closed",
                 "G Minerva · Redump 1 3 closed",
                 "G archive.org · built-in sets 1 2 closed",
-                "G archive.org · restricted (romgetter archive-login) 1 5 closed",
+                "G archive.org · restricted (log in on the Config tab) 1 5 closed",
                 "G Live search (as you type) 2 0 1off closed",
             ]
         );
@@ -3784,6 +3858,110 @@ mod tests {
         app.cache_jobs.insert((Debrid::TorBox, "aa".into()), CacheJob { state: "downloading".into(), progress: 0.4, done: false });
         assert_eq!(app.cache_targets(&small), vec![Debrid::RealDebrid]);
         assert_eq!(app.set_info(&small, "psx").caching, vec![("TorBox", "downloading".to_string(), 0.4, false)]);
+    }
+
+    #[tokio::test]
+    async fn config_tab_changes_settings() {
+        let mut app = test_app(Vec::new());
+        app.editing = false;
+        app.press(KeyCode::Char('5'));
+        assert!(app.tab == Tab::Config);
+        let typed = |app: &mut App, s: &str| {
+            for c in s.chars() {
+                app.press(KeyCode::Char(c));
+            }
+            app.press(KeyCode::Enter);
+        };
+        let go = |app: &mut App, f: Field| {
+            app.cfg_tab.cursor = 0;
+            while app.cfg_field() != Some(f) {
+                let before = app.cfg_tab.cursor;
+                app.press(KeyCode::Down);
+                assert_ne!(before, app.cfg_tab.cursor, "{f:?} not found");
+            }
+        };
+
+        // a key: typed hidden, saved, and needs a restart
+        go(&mut app, Field::RdKey);
+        app.press(KeyCode::Enter);
+        assert!(app.editing && app.cfg_tab.edit.as_ref().is_some_and(settings::CfgEdit::secret));
+        typed(&mut app, "abcdefghijkl");
+        assert_eq!(app.cfg.real_debrid_api_key.as_deref(), Some("abcdefghijkl"));
+        assert!(!app.editing && app.cfg_tab.restart_for == ["the Real-Debrid key"]);
+        assert_eq!(app.cfg_field(), Some(Field::RdKey), "the restart row above keeps the cursor on the key");
+
+        // Esc leaves it as it was
+        go(&mut app, Field::Poll);
+        app.press(KeyCode::Enter);
+        assert_eq!(app.cfg_tab.edit.as_ref().map(|e| e.text.as_str()), Some("5"), "starts from the current value");
+        app.press(KeyCode::Char('0'));
+        app.press(KeyCode::Esc);
+        assert_eq!(app.cfg.poll_secs, 5);
+        // applies at once
+        app.press(KeyCode::Enter);
+        app.press(KeyCode::Backspace);
+        typed(&mut app, "9");
+        assert!(app.cfg.poll_secs == 9 && app.ctx.poll == Duration::from_secs(9));
+        app.press(KeyCode::Enter);
+        app.press(KeyCode::Backspace);
+        typed(&mut app, "1");
+        assert_eq!(app.cfg.poll_secs, 9, "too short: {}", app.status);
+
+        // extra sets: added from a URL and indexed, removed from the row's menu
+        go(&mut app, Field::AddSet);
+        app.press(KeyCode::Enter);
+        typed(&mut app, "https://archive.org/details/some-set_1");
+        assert_eq!(app.cfg.extra_sets.iter().map(|c| c.item.as_str()).collect::<Vec<_>>(), ["some-set_1"]);
+        assert!(app.sets.iter().any(|s| s.item == "some-set_1"));
+        assert_eq!(app.cfg_field(), Some(Field::ExtraSet(0)));
+        app.press(KeyCode::Enter);
+        let m = app.menu.as_ref().unwrap();
+        assert_eq!(m.items[0].0, "Remove this set");
+        app.press(KeyCode::Enter);
+        assert!(app.cfg.extra_sets.is_empty() && !app.sets.iter().any(|s| s.item == "some-set_1"));
+
+        // archive.org: email, then a hidden password
+        go(&mut app, Field::Archive);
+        app.press(KeyCode::Enter);
+        typed(&mut app, "me@example.com");
+        assert!(app.cfg_tab.edit.as_ref().is_some_and(|e| e.secret() && e.email.as_deref() == Some("me@example.com")));
+        app.press(KeyCode::Esc);
+        assert!(app.cfg_tab.edit.is_none() && !app.cfg_tab.logging_in);
+
+        // restart: from the top row
+        go(&mut app, Field::Restart);
+        app.press(KeyCode::Enter);
+        assert!(app.restart && app.quit);
+    }
+
+    #[tokio::test]
+    async fn old_group_switches_become_sources_switches() {
+        let dir = std::env::temp_dir().join(format!("romgetter-groups-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        std::fs::write(&path, format!("roms_dir = {:?}\nuse_ifarchive = false\nuse_minerva = false\n", dir.join("roms"))).unwrap();
+        let cfg = Config::load(&path).unwrap();
+        assert!(cfg.use_ifarchive && cfg.use_minerva, "groups always load now");
+        assert!(!toml::to_string(&cfg).unwrap().contains("use_"), "and the old switches aren't written back");
+        let cfg = Config { use_default_sets: false, ..cfg };
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let (local_tx, _lrx) = tokio::sync::mpsc::unbounded_channel();
+        let ctx =
+            jobs::Ctx { http: reqwest::Client::new(), torbox: None, rd: None, roms_dir: dir.join("roms"), poll: Duration::from_secs(5) };
+        let mut app = App::new(cfg, dir.join("cache"), Library::load(dir.join("library.json")).unwrap(), tx, local_tx, ctx);
+        assert!(app.sets.iter().any(|s| s.item == ifarchive::KEY), "the IF Archive is listed");
+        assert!(!app.cfg.source_on(ifarchive::KEY), "but switched off");
+        // a Minerva folder list arriving later: its sets come in off too
+        let folder = minerva::Folder { name: "Nintendo - Super Nintendo Entertainment System".into(), size: 1 };
+        app.on_msg(Msg::MinervaFolders("No-Intro".into(), Ok(vec![folder])));
+        let key = minerva::set_key("No-Intro", "Nintendo - Super Nintendo Entertainment System");
+        assert!(app.sets.iter().any(|s| s.item == key) && !app.cfg.source_on(&key));
+        // and Space on the group header turns the group back on
+        app.tab = Tab::Sources;
+        app.editing = false;
+        app.sets_cursor = Some(format!("\u{1}{}", SET_GROUPS[6]));
+        app.press(KeyCode::Char(' '));
+        assert!(app.cfg.source_on(ifarchive::KEY));
     }
 
     fn test_app(games: Vec<Game>) -> App {
@@ -4197,7 +4375,11 @@ mod tests {
         app.on_pad(Pad::RB);
         assert!(app.tab == Tab::Sources);
         app.on_pad(Pad::RB);
+        assert!(app.tab == Tab::Config);
+        app.on_pad(Pad::RB);
         assert!(app.tab == Tab::Search, "wraps around");
+        app.on_pad(Pad::LB);
+        assert!(app.tab == Tab::Config);
         app.on_pad(Pad::LB);
         assert!(app.tab == Tab::Sources);
         app.on_pad(Pad::LB);

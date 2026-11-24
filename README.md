@@ -22,7 +22,7 @@ chmod +x ~/romgetter
 ~/romgetter
 ```
 
-On the Deck the config goes in `~/.config/romgetter/config.toml` (copy your `torbox_api_key` over), and ROMs go to `~/retrodeck/roms` by default. If RetroDECK lives on the SD card, set `roms_dir` to `/run/media/<card>/retrodeck/roms`.
+On the Deck the config goes in `~/.config/romgetter/config.toml`, and ROMs go to `~/retrodeck/roms` by default. Enter the API keys and, if RetroDECK lives on the SD card, the roms folder (`/run/media/<card>/retrodeck/roms`) on the **5 Config** tab; Steam's keyboard (Steam+X) types them.
 
 ### Game Mode with a controller
 
@@ -51,7 +51,7 @@ To change the font size, set `ROMGETTER_FONT_SIZE` in the shortcut's launch opti
 
 ## Setup
 
-On first run a config is created at:
+Everything below can be set on the **5 Config** tab, which saves this file. On first run a config is created at:
 
 - Linux / Steam Deck: `~/.config/romgetter/config.toml`
 - macOS: `~/Library/Application Support/romgetter/config.toml`
@@ -61,10 +61,6 @@ On first run a config is created at:
 torbox_api_key = "..."            # or export TORBOX_API_KEY
 roms_dir = "/home/deck/retrodeck/roms"
 poll_secs = 5
-use_minerva = true                # search Minerva's No-Intro/Redump torrents
-use_default_sets = true           # search the built-in archive.org sets
-use_torbox_zips = true            # search ROM-set torrents in your TorBox account (zipped or loose)
-use_ifarchive = true              # search the IF Archive's free interactive fiction
 real_debrid_api_key = "..."       # optional; or export REAL_DEBRID_API_KEY
 browser = "flatpak run org.mozilla.firefox"   # optional; default: Firefox/Chrome, else the system's
 downloads_dir = "/home/deck/Downloads"        # optional; where the browser saves files
@@ -84,7 +80,7 @@ Your library is stored as `library.json` next to the config on macOS, or in `~/.
 
 ### archive.org login (restricted sets)
 
-Some archive.org sets are "restricted": only a logged-in account can download their files (e.g. the Redump Xbox 360 set `microsoft_xbox360_a_part1` … `_z`). Log in once:
+Some archive.org sets are "restricted": only a logged-in account can download their files (e.g. the Redump Xbox 360 set `microsoft_xbox360_a_part1` … `_z`). Log in once on the Config tab (archive.org → email, then password), or from a shell:
 
 ```sh
 romgetter archive-login you@example.com   # asks for the password (not echoed)
@@ -148,9 +144,19 @@ Keys: `Enter` installs a pack and turns it on, or turns an installed one on/off 
 
 `romgetter textures` prints which packs fit the games on disk; `romgetter textures install <words>` installs the first matching pack (e.g. `romgetter textures install conker`).
 
-**4 Sources**: every set Search uses, grouped by where it comes from: Minerva No-Intro, Minerva Redump, your TorBox torrents, the built-in archive.org sets, restricted archive.org sets, your `extra_sets`, and the IF Archive, plus the sites searched live as you type (archive.org search, Vimm's Lair). Each group header shows how many sets and games it holds, and how many are off; groups start closed. Each set shows its status (`⚡ cached` on TorBox, `● indexed`, `… indexing`, `○ waiting`, `✗ failed` with the reason, `🔒 login` for restricted sets until `romgetter archive-login`), its system, game count, size, and when it was indexed.
-Any source can be switched off and on: `Space` on a set or site toggles it, and on a group header it turns the whole group off (or, if it's all off, back on). Off sets show `○ off`, drop out of Search and of the Library's source matching, and aren't indexed; switching one back on indexes it if needed. The choice is saved in the config's `[sources]` table; everything starts on except Vimm's Lair (an old `use_vimm = true` carries over).
+**4 Sources**: every set Search uses, grouped by where it comes from: Minerva No-Intro, Minerva Redump, your TorBox torrents, the built-in archive.org sets, restricted archive.org sets, your `extra_sets`, and the IF Archive, plus the sites searched live as you type (archive.org search, Vimm's Lair). Each group header shows how many sets and games it holds, and how many are off; groups start closed. Each set shows its status (`⚡ cached` on TorBox, `● indexed`, `… indexing`, `○ waiting`, `✗ failed` with the reason, `🔒 login` for restricted sets until you log in to archive.org on the Config tab), its system, game count, size, and when it was indexed.
+Any source can be switched off and on: `Space` on a set or site toggles it, and on a group header it turns the whole group off (or, if it's all off, back on). Off sets show `○ off`, drop out of Search and of the Library's source matching, and aren't indexed; switching one back on indexes it if needed. The choice is saved in the config's `[sources]` table and applies at once, with no restart; everything starts on except Vimm's Lair. Old switches carry over: `use_vimm = true` turns Vimm's Lair on, and `use_minerva`, `use_default_sets`, `use_torbox_zips` or `use_ifarchive = false` turn that group's sets off here.
 Keys: `Space` on/off · `Enter` opens a group, or on a set lists its actions: turn it off/on, search that system (jumps to Search with the system typed in), or index the set again now, or **cache it to TorBox / Real-Debrid**. That last one is offered for torrent-backed sets (Minerva folders) under 1 TB, once per configured service, unless TorBox already has the whole torrent (in your account or fully cached). It sends the whole torrent (every file) to that service so its games download straight away later; the set's row shows `⇣ TorBox downloading 40%` while it caches and `✓ cached on TorBox` when done (TorBox progress also shows after a restart; Real-Debrid's only for this session) · `←`/`→` close/open the group you're in · `m` opens or closes every group.
+
+**5 Config**: the settings in the config file, changed in place and saved straight away.
+
+- **Accounts**: the TorBox and Real-Debrid API keys (typed hidden, shown as `••••••••abcd`). Each key is checked with its service when the tab opens and after it's changed: `✓ you@example.com · pro`, `✓ user · premium until 2026-12-31`, or `✗` with the reason. A key set in the environment (`TORBOX_API_KEY`, `REAL_DEBRID_API_KEY`) wins over the config, and the row says so. **archive.org** logs in (email, then password; only the session is kept) or out.
+- **Folders**: the roms folder (`✗ not there` if it's missing) and the browser's downloads folder watched for Vimm games. `~` stands for the home folder.
+- **Other**: the browser command for Vimm pages, and how often TorBox is checked while games download.
+- **Your extra sets**: archive.org sets searched on top of the built-in ones. `+ Add a set…` takes an identifier or an archive.org URL and indexes it right away; `Enter` on a set removes it.
+
+The downloads folder, browser, check interval and extra sets apply at once. Keys, the archive.org login and the roms folder apply at startup: the tab then shows `Restart romgetter` at the top (and `5 Config (restart)` in the tab bar), which starts romgetter again in place with the same arguments.
+Keys: `Enter` changes the setting (or switches it), `Space` lists its actions (change, back to the default / remove the key / log out, check the key), `Esc` cancels typing. On a controller: A changes, B lists actions, X is off here.
 
 ## System detection
 

@@ -28,19 +28,21 @@ pub struct Config {
     /// Seconds between TorBox status polls.
     #[serde(default = "default_poll")]
     pub poll_secs: u64,
-    /// Search Minerva (torrents of No-Intro/Redump, usually cached on TorBox).
-    #[serde(default = "yes")]
+    // Which groups of sets exist at all: Minerva, the built-in archive.org sets, ROM-set
+    // torrents in the TorBox account, the IF Archive. Always on from a config file: an old
+    // `use_minerva = false` etc. becomes the group's sets switched off in the Sources tab
+    // (`groups_off`, applied at startup); only tests leave groups out.
+    #[serde(default = "yes", skip_serializing)]
     pub use_minerva: bool,
-    /// Search the built-in No-Intro/Redump sets (see sources.rs).
-    #[serde(default = "yes")]
+    #[serde(default = "yes", skip_serializing)]
     pub use_default_sets: bool,
-    /// Search ROM-set torrents already in the TorBox account, zipped by TorBox or loose
-    /// (e.g. "1G1R - Redump - Sony - PlayStation").
-    #[serde(default = "yes")]
+    #[serde(default = "yes", skip_serializing)]
     pub use_torbox_zips: bool,
-    /// Search the IF Archive's free interactive fiction (played with Gargoyle).
-    #[serde(default = "yes")]
+    #[serde(default = "yes", skip_serializing)]
     pub use_ifarchive: bool,
+    /// Groups an old `use_*` switch had off (see above), to switch off in the Sources tab.
+    #[serde(skip)]
+    pub groups_off: Vec<Group>,
     /// Old switch for Vimm's Lair; now `[sources] vimm = true` (read once, then dropped).
     #[serde(default, skip_serializing)]
     pub use_vimm: bool,
@@ -63,6 +65,15 @@ pub struct Config {
     /// an archive.org identifier), "archive.org" (live search) or "vimm".
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub sources: std::collections::BTreeMap<String, bool>,
+}
+
+/// Groups of sets the old `use_*` switches covered.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Group {
+    Minerva,
+    DefaultSets,
+    TorboxZips,
+    IfArchive,
 }
 
 /// Live-search sources (Sources tab keys).
@@ -101,6 +112,7 @@ impl Default for Config {
             use_default_sets: true,
             use_torbox_zips: true,
             use_ifarchive: true,
+            groups_off: Vec::new(),
             use_vimm: false,
             browser: None,
             downloads_dir: None,
@@ -135,6 +147,16 @@ impl Config {
         }
         let text = std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
         let mut cfg: Config = toml::from_str(&text).with_context(|| format!("parsing {}", path.display()))?;
+        for (on, group) in [
+            (&mut cfg.use_minerva, Group::Minerva),
+            (&mut cfg.use_default_sets, Group::DefaultSets),
+            (&mut cfg.use_torbox_zips, Group::TorboxZips),
+            (&mut cfg.use_ifarchive, Group::IfArchive),
+        ] {
+            if !std::mem::replace(on, true) {
+                cfg.groups_off.push(group);
+            }
+        }
         if std::mem::take(&mut cfg.use_vimm) {
             cfg.sources.entry(LIVE_VIMM.into()).or_insert(true);
         }
