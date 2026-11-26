@@ -1,5 +1,6 @@
 mod app;
 mod archive;
+mod compress;
 mod config;
 mod gamepad;
 mod ifarchive;
@@ -71,6 +72,12 @@ async fn main() -> Result<()> {
         poll: Duration::from_secs(cfg.poll_secs.max(2)),
         http,
     };
+
+    // `romgetter pack [system...]`: pack every zipped or loose disc game on disk as CHD / RVZ.
+    if std::env::args().nth(1).as_deref() == Some("pack") {
+        let only: Vec<String> = std::env::args().skip(2).collect();
+        return pack_cli(lib, &ctx, &only).await;
+    }
 
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Msg>();
     let (local_tx, mut local_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -394,4 +401,58 @@ fn prompt(label: &str, hidden: bool) -> Result<String> {
     terminal::disable_raw_mode()?;
     println!();
     res
+}
+
+/// Headless "Pack all": every game on disk (in the library, or just found in the roms
+/// folder) that's zipped or a loose disc image, in `only`'s systems if given, packed one
+/// at a time. Library entries are pointed at the packed files.
+async fn pack_cli(mut lib: library::Library, ctx: &jobs::Ctx, only: &[String]) -> Result<()> {
+    use std::io::Write;
+    let roms = &ctx.roms_dir;
+    let mut games: Vec<library::Game> = lib.games.clone();
+    let known: std::collections::HashSet<String> = games.iter().flat_map(|g| g.local_keys(roms)).collect();
+    for f in library::scan(roms).into_iter().filter(|f| !known.contains(&f.rel.to_lowercase())) {
+        let mut g = library::Game::local(f.system, f.rel, f.size);
+        g.local_files.extend(f.tracks);
+        games.push(g);
+    }
+    let todo: Vec<(library::Game, Vec<String>)> = games
+        .into_iter()
+        .filter(|g| only.is_empty() || only.contains(&g.system))
+        .filter(|g| compress::usable(&g.system).is_some())
+        .filter_map(|g| ps3::needs_setup(&g, roms).map(|files| (g, files)))
+        .collect();
+    if todo.is_empty() {
+        println!("nothing to pack (or no chdman / dolphin-tool found)");
+        return Ok(());
+    }
+    let (mut ok, mut failed, mut before, mut after) = (0, 0, 0u64, 0u64);
+    let size = |rels: &[String]| rels.iter().filter_map(|r| std::fs::metadata(roms.join(r)).ok()).map(|m| m.len()).sum::<u64>();
+    for (i, (g, files)) in todo.iter().enumerate() {
+        let n = size(files);
+        let send = |s: jobs::LocalState| {
+            if let jobs::LocalState::Downloading { file, done, total } = s {
+                let pct = if total > 0 { format!(" {:.0}%", done as f64 / total as f64 * 100.0) } else { String::new() };
+                print!("\r\x1b[K[{}/{}] {file}{pct}", i + 1, todo.len());
+                let _ = std::io::stdout().flush();
+            }
+        };
+        match ps3::finish(files.clone(), ctx, &send).await {
+            Ok(out) => {
+                let m = size(&out);
+                println!("\r\x1b[K[{}/{}] {} → {} ({} MB → {} MB)", i + 1, todo.len(), g.name, out.join(", "), n >> 20, m >> 20);
+                (ok, before, after) = (ok + 1, before + n, after + m);
+                if let Some(lg) = lib.get_mut(&g.id) {
+                    lg.local_files = out;
+                }
+                lib.save()?;
+            }
+            Err(e) => {
+                println!("\r\x1b[K[{}/{}] {} FAILED: {e:#}", i + 1, todo.len(), g.name);
+                failed += 1;
+            }
+        }
+    }
+    println!("packed {ok}, failed {failed}: {} MB → {} MB", before >> 20, after >> 20);
+    Ok(())
 }

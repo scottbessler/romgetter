@@ -104,7 +104,20 @@ fn local_rels(game: &Game, roms_dir: &Path) -> Vec<String> {
 /// run it: a zip to unpack, or (PS3) an ISO without its `.dkey`. Returns its files for `finish`. Also covers an
 /// ISO unpacked from the zip the library still points at (the zip is deleted after
 /// unpacking), so a retry never downloads the whole disc again.
+///
+/// Where CHD / RVZ tools are installed (see `crate::compress`), a CD / DVD / GameCube /
+/// Wii game is also pending while it's zipped or still a loose image (.cue/.bin, .iso).
 pub fn needs_setup(game: &Game, roms_dir: &Path) -> Option<Vec<String>> {
+    needs_setup_with(game, roms_dir, crate::compress::usable(&game.system).is_some())
+}
+
+fn needs_setup_with(game: &Game, roms_dir: &Path, can_pack: bool) -> Option<Vec<String>> {
+    if can_pack {
+        let rels = local_rels(game, roms_dir);
+        let ready = !rels.is_empty() && rels.iter().all(|r| roms_dir.join(r).is_file());
+        let pending = rels.iter().any(|r| is_zip(r) || crate::library::has_ext(r, "7z") || crate::compress::is_input(r));
+        return (ready && pending).then_some(rels);
+    }
     if UNZIP_ALL_SYSTEMS.contains(&game.system.as_str()) || UNZIP_MULTI_FILE_SYSTEMS.contains(&game.system.as_str()) {
         let rels = local_rels(game, roms_dir);
         let ready = !rels.is_empty() && rels.iter().all(|r| roms_dir.join(r).is_file());
@@ -133,10 +146,17 @@ fn is_iso(rel: &str) -> bool {
     rel.starts_with("ps3/") && rel.to_lowercase().ends_with(".iso")
 }
 
-/// Unzip PS3 / Xbox 360 ISOs and add PS3 disc keys. Other files pass through unchanged.
+/// Unzip PS3 / Xbox 360 ISOs and add PS3 disc keys; pack CD / DVD / GameCube / Wii
+/// games as CHD / RVZ when the tool is there (else unzip them as their emulator needs).
+/// Other files pass through unchanged.
 pub async fn finish(files: Vec<String>, ctx: &Ctx, send: &impl Fn(LocalState)) -> Result<Vec<String>> {
     let mut out = Vec::new();
     for rel in files {
+        let system = rel.split('/').next().unwrap_or("");
+        if crate::compress::usable(system).is_some() && (is_zip(&rel) || crate::library::has_ext(&rel, "7z")) {
+            out.extend(pack_archive(&rel, ctx, send).await?);
+            continue;
+        }
         if is_unpack_7z(&rel) {
             out.extend(unpack_7z(&rel, ctx, send).await?);
             continue;
@@ -165,7 +185,176 @@ pub async fn finish(files: Vec<String>, ctx: &Ctx, send: &impl Fn(LocalState)) -
         // missing key shows as "needs key" (see needs_setup), not as a missing game.
         out.push(rel);
     }
+    pack_loose(out, ctx, send).await
+}
+
+fn base(rel: &str) -> &str {
+    rel.rsplit('/').next().unwrap_or(rel)
+}
+
+fn rel_of(path: &Path, roms_dir: &Path) -> String {
+    path.strip_prefix(roms_dir).unwrap_or(path).to_string_lossy().replace('\\', "/")
+}
+
+/// Unpack a downloaded zip / 7z into a hidden folder next to it, pack each disc image in
+/// it as one CHD / RVZ beside the zip, move any other files (an .m3u, .sbi, a ready
+/// .chd) there too, then delete the zip. On failure the zip stays and the folder goes.
+async fn pack_archive(rel: &str, ctx: &Ctx, send: &impl Fn(LocalState)) -> Result<Vec<String>> {
+    let path = ctx.roms_dir.join(rel);
+    let (dir_rel, name) = rel.rsplit_once('/').unwrap_or(("", rel));
+    let system = dir_rel.split('/').next().unwrap_or("");
+    let stem = name.rsplit_once('.').map(|(s, _)| s).unwrap_or(name);
+    let dir = ctx.roms_dir.join(dir_rel);
+    let tmp = dir.join(format!(".romgetter-{stem}"));
+    let _turn = crate::compress::turn(stem, send).await;
+    let _ = std::fs::remove_dir_all(&tmp);
+    std::fs::create_dir_all(&tmp).with_context(|| format!("creating {}", tmp.display()))?;
+    let res = async {
+        let names = extract_into(&path, &tmp, send).await?;
+        let inputs: Vec<&String> = names.iter().filter(|n| crate::compress::is_input(&format!("{system}/{n}"))).collect();
+        // an .iso a .cue points at is that cue's track, not a disc of its own
+        let tracks: std::collections::HashSet<PathBuf> =
+            inputs.iter().flat_map(|n| crate::compress::disc_files(&tmp.join(n)).into_iter().skip(1)).collect();
+        let mut used = std::collections::HashSet::new();
+        let mut renamed = Vec::new();
+        let mut outs = Vec::new();
+        for n in inputs.into_iter().filter(|n| !tracks.contains(&tmp.join(n))) {
+            let input = tmp.join(n);
+            used.extend(crate::compress::disc_files(&input));
+            let packed = crate::compress::convert(system, &input, &dir, send).await?;
+            let new_rel = rel_of(&packed, &ctx.roms_dir);
+            renamed.push((n.to_lowercase(), base(&new_rel).to_string()));
+            outs.push(new_rel);
+        }
+        for n in &names {
+            let p = tmp.join(n);
+            if !used.contains(&p) && p.is_file() {
+                std::fs::rename(&p, dir.join(n)).with_context(|| format!("moving {n}"))?;
+                outs.push(format!("{dir_rel}/{n}"));
+            }
+        }
+        rewrite_m3us(&outs, &renamed, &ctx.roms_dir);
+        anyhow::Ok(outs)
+    }
+    .await;
+    let _ = std::fs::remove_dir_all(&tmp);
+    let outs = res?;
+    tokio::fs::remove_file(&path).await.with_context(|| format!("removing {}", path.display()))?;
+    Ok(outs)
+}
+
+/// Extract a zip or 7z into `dir` (flat), with progress. Returns the file names.
+async fn extract_into(path: &Path, dir: &Path, send: &impl Fn(LocalState)) -> Result<Vec<String>> {
+    let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    let label = format!("unzipping {name}");
+    let done = Arc::new(AtomicU64::new(0));
+    let total = Arc::new(AtomicU64::new(0));
+    let task = {
+        let (path, dir, done, total) = (path.to_path_buf(), dir.to_path_buf(), done.clone(), total.clone());
+        tokio::task::spawn_blocking(move || {
+            if crate::library::has_ext(&path.to_string_lossy(), "7z") {
+                crate::vimm::extract_7z(&path, &dir, &|d, t| {
+                    done.store(d, Ordering::Relaxed);
+                    total.store(t, Ordering::Relaxed);
+                })
+            } else {
+                extract_all(&path, &dir, &done, &total)
+            }
+        })
+    };
+    tokio::pin!(task);
+    loop {
+        tokio::select! {
+            res = &mut task => return res?,
+            () = tokio::time::sleep(Duration::from_millis(250)) => {
+                send(LocalState::Downloading { file: label.clone(), done: done.load(Ordering::Relaxed), total: total.load(Ordering::Relaxed) });
+            }
+        }
+    }
+}
+
+/// Pack loose disc images (a .cue and its .bins, an .iso) as CHD / RVZ in place and
+/// delete the originals. Returns `rels` with each image replaced by its packed file and
+/// its tracks dropped; .m3u playlists among them are pointed at the packed discs. If a
+/// later disc fails after some were packed, the packed ones are kept and returned (the
+/// rest still show as pending, and retrying shows the error).
+async fn pack_loose(rels: Vec<String>, ctx: &Ctx, send: &impl Fn(LocalState)) -> Result<Vec<String>> {
+    let roms = &ctx.roms_dir;
+    let inputs: Vec<String> = rels
+        .iter()
+        .filter(|r| crate::compress::is_input(r) && crate::compress::usable(r.split('/').next().unwrap_or("")).is_some())
+        .filter(|r| roms.join(r).is_file())
+        .cloned()
+        .collect();
+    if inputs.is_empty() {
+        return Ok(rels);
+    }
+    let _turn = crate::compress::turn(base(&inputs[0]), send).await;
+    let tracks: std::collections::HashSet<String> = inputs
+        .iter()
+        .flat_map(|r| crate::compress::disc_files(&roms.join(r)).into_iter().skip(1))
+        .map(|p| rel_of(&p, roms))
+        .collect();
+    let mut gone = std::collections::HashSet::new();
+    let mut packed: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    for rel in inputs.iter().filter(|r| !tracks.contains(*r)) {
+        let path = roms.join(rel);
+        let system = rel.split('/').next().unwrap_or("");
+        let dir = path.parent().unwrap_or(roms).to_path_buf();
+        let files = crate::compress::disc_files(&path);
+        match crate::compress::convert(system, &path, &dir, send).await {
+            Ok(out) => {
+                for f in files {
+                    let _ = std::fs::remove_file(&f);
+                    gone.insert(rel_of(&f, roms));
+                }
+                packed.insert(rel.clone(), rel_of(&out, roms));
+            }
+            Err(e) if packed.is_empty() => return Err(e),
+            Err(_) => break,
+        }
+    }
+    let renamed: Vec<(String, String)> = packed.iter().map(|(a, b)| (base(a).to_lowercase(), base(b).to_string())).collect();
+    let out: Vec<String> = rels
+        .into_iter()
+        .filter_map(|r| match packed.get(&r) {
+            Some(p) => Some(p.clone()),
+            None if gone.contains(&r) => None,
+            None => Some(r),
+        })
+        .collect();
+    rewrite_m3us(&out, &renamed, roms);
     Ok(out)
+}
+
+/// Point .m3u playlists at packed discs: a line naming "Disc 1.cue" becomes "Disc 1.chd".
+fn rewrite_m3us(rels: &[String], renamed: &[(String, String)], roms_dir: &Path) {
+    if renamed.is_empty() {
+        return;
+    }
+    for rel in rels.iter().filter(|r| crate::library::has_ext(r, "m3u")) {
+        let path = roms_dir.join(rel);
+        let Ok(text) = std::fs::read_to_string(&path) else { continue };
+        let mut changed = false;
+        let lines: Vec<String> = text
+            .lines()
+            .map(|l| {
+                let name = l.trim().trim_matches('"');
+                let b = name.rsplit(['/', '\\']).next().unwrap_or(name);
+                match renamed.iter().find(|(from, _)| *from == b.to_lowercase()) {
+                    Some((_, to)) if !l.trim_start().starts_with('#') => {
+                        changed = true;
+                        let prefix = &name[..name.len() - b.len()];
+                        format!("{prefix}{to}")
+                    }
+                    _ => l.to_string(),
+                }
+            })
+            .collect();
+        if changed {
+            let _ = std::fs::write(&path, lines.join("\n") + "\n");
+        }
+    }
 }
 
 /// Extract the .iso from a downloaded PS3 zip next to it, then delete the zip.
@@ -692,6 +881,39 @@ mod tests {
         assert_eq!(std::fs::read(dir.join("neogeocd/Game (USA) (Track 1).bin")).unwrap(), vec![1u8; 300]);
         assert_eq!(t.load(Ordering::Relaxed), 504);
         assert_eq!(d.load(Ordering::Relaxed), 504);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn packs_disc_games_when_a_tool_is_there() {
+        let dir = std::env::temp_dir().join(format!("romgetter-pack-setup-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("psx")).unwrap();
+        std::fs::create_dir_all(dir.join("snes")).unwrap();
+        std::fs::write(dir.join("psx/One (USA).zip"), zip_of(&[("One (USA).bin", b"x")])).unwrap();
+        std::fs::write(dir.join("psx/Loose (USA).cue"), "FILE \"Loose (USA).bin\" BINARY\n").unwrap();
+        std::fs::write(dir.join("psx/Loose (USA).bin"), b"x").unwrap();
+        std::fs::write(dir.join("psx/Done (USA).chd"), b"x").unwrap();
+        let one = Game::local("psx", "psx/One (USA).zip".into(), 1);
+        let mut loose = Game::local("psx", "psx/Loose (USA).cue".into(), 1);
+        loose.local_files.push("psx/Loose (USA).bin".into());
+        let done = Game::local("psx", "psx/Done (USA).chd".into(), 1);
+        // a single-file zip RetroArch could open is still packed (no unzip at every launch)
+        assert_eq!(needs_setup_with(&one, &dir, true), Some(vec!["psx/One (USA).zip".to_string()]));
+        assert_eq!(needs_setup_with(&one, &dir, false), None);
+        assert_eq!(needs_setup_with(&loose, &dir, true).map(|r| r.len()), Some(2));
+        assert_eq!(needs_setup_with(&loose, &dir, false), None);
+        assert_eq!(needs_setup_with(&done, &dir, true), None);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn points_playlists_at_packed_discs() {
+        let dir = std::env::temp_dir().join(format!("romgetter-m3u-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("psx")).unwrap();
+        std::fs::write(dir.join("psx/G.m3u"), "#EXTM3U\nG (Disc 1).cue\n\"sub/G (Disc 2).CUE\"\nOther.chd\n").unwrap();
+        let renamed = vec![("g (disc 1).cue".into(), "G (Disc 1).chd".into()), ("g (disc 2).cue".into(), "G (Disc 2).chd".into())];
+        rewrite_m3us(&["psx/G.m3u".into()], &renamed, &dir);
+        assert_eq!(std::fs::read_to_string(dir.join("psx/G.m3u")).unwrap(), "#EXTM3U\nG (Disc 1).chd\nsub/G (Disc 2).chd\nOther.chd\n");
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

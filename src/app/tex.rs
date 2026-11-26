@@ -1,10 +1,30 @@
-//! The Textures tab: texture packs for the GameCube and N64 games on disk.
+//! The Textures tab: texture packs for the games on disk, one row per game and one row
+//! per pack under it (shown when the game is chosen).
 
 use super::{Act, App, Menu, Msg};
 use crate::library::now_secs;
 use crate::textures::{self, Catalog, Dirs, Installed, Pack, Reach, TexState};
 use ratatui::widgets::ListState;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+
+
+/// Catalog packs name their system after the sheet's tab; the library uses its own folder
+/// names (`systems.rs`). Keep only the ones the library knows about.
+fn known_system(s: &str) -> Option<&'static str> {
+    Some(match s {
+        "gc" => "gc",
+        "n64" => "n64",
+        "ps2" => "ps2",
+        "wii" => "wii",
+        "psx" => "psx",
+        "psp" => "psp",
+        "psvita" => "psvita",
+        "n3ds" => "n3ds",
+        "switch" => "switch",
+        "dreamcast" => "dreamcast",
+        _ => return None,
+    })
+}
 
 pub struct TexTab {
     pub catalog: Option<Catalog>,
@@ -21,6 +41,10 @@ pub struct TexTab {
     pub matches: Vec<(&'static str, String, Vec<usize>)>,
     /// Games on disk per system (with or without packs).
     pub on_disk: HashMap<&'static str, usize>,
+    /// Systems whose games are hidden (`▸`); every other system shows its games.
+    pub collapsed: HashSet<&'static str>,
+    /// Game ids whose packs are shown (`▾`) under the game row.
+    pub expanded: HashSet<String>,
     pub dirs: Dirs,
     opened: bool,
 }
@@ -39,9 +63,12 @@ pub enum TexRow {
         system: &'static str,
         with_packs: usize,
         on_disk: usize,
+        /// Total packs across this system's games on disk.
+        packs: usize,
+        collapsed: bool,
     },
-    /// index into `lib.games`
-    Game(usize),
+    /// A game on disk: index into `lib.games`, how many packs fit it, how many are enabled.
+    Game { game: usize, packs: usize, enabled: usize },
     /// (index into `lib.games`, index into the catalog)
     Pack(usize, usize),
 }
@@ -59,6 +86,8 @@ impl TexTab {
             tags: HashMap::new(),
             matches: Vec::new(),
             on_disk: HashMap::new(),
+            collapsed: HashSet::new(),
+            expanded: HashSet::new(),
             dirs,
             opened: false,
         }
@@ -88,7 +117,7 @@ impl App {
             return;
         }
         self.tex.loading = true;
-        self.status = "fetching texture pack lists (EmulationKing, rapka, putachi)…".into();
+        self.status = "fetching texture pack lists (EmulationKing, rapka, putachi, the texture sheet)…".into();
         let (http, tx) = (self.ctx.http.clone(), self.tx.clone());
         tokio::spawn(async move {
             let _ = tx.send(Msg::TexCatalog(textures::fetch_catalog(&http).await));
@@ -100,7 +129,17 @@ impl App {
         let roms = self.ctx.roms_dir.clone();
         let mut matches = Vec::new();
         let mut on_disk: HashMap<&'static str, usize> = HashMap::new();
-        for system in textures::SYSTEMS {
+        let mut systems: Vec<&'static str> = textures::SYSTEMS.to_vec();
+        if let Some(c) = &self.tex.catalog {
+            for p in &c.packs {
+                if let Some(sys) = known_system(&p.system)
+                    && !systems.contains(&sys)
+                {
+                    systems.push(sys);
+                }
+            }
+        }
+        for system in systems {
             let mut games: Vec<&crate::library::Game> =
                 self.lib.games.iter().filter(|g| g.system == system && self.present.contains(&g.id)).collect();
             games.sort_by_cached_key(|g| g.name.to_lowercase());
@@ -129,13 +168,44 @@ impl App {
 
     pub fn tex_rows(&self) -> Vec<TexRow> {
         let mut rows = Vec::new();
-        for system in textures::SYSTEMS {
+        let mut systems: Vec<&'static str> = textures::SYSTEMS.to_vec();
+        if let Some(c) = &self.tex.catalog {
+            for p in &c.packs {
+                if let Some(sys) = known_system(&p.system)
+                    && !systems.contains(&sys)
+                {
+                    systems.push(sys);
+                }
+            }
+        }
+        for system in systems {
             let games: Vec<_> = self.tex.matches.iter().filter(|m| m.0 == system).collect();
-            rows.push(TexRow::System { system, with_packs: games.len(), on_disk: self.tex.on_disk.get(system).copied().unwrap_or(0) });
+            let pack_total: usize = games.iter().map(|g| g.2.len()).sum();
+            let with_packs = games.len();
+            // Systems with no on-disk game that has a pack are left out, except the two the tab
+            // has always shown (so "0 of N on disk" still tells you nothing's available).
+            if with_packs == 0 && !textures::SYSTEMS.contains(&system) {
+                continue;
+            }
+            let collapsed = self.tex.collapsed.contains(system);
+            rows.push(TexRow::System {
+                system,
+                with_packs,
+                on_disk: self.tex.on_disk.get(system).copied().unwrap_or(0),
+                packs: pack_total,
+                collapsed,
+            });
+            if collapsed {
+                continue;
+            }
             for (_, id, packs) in games {
                 let Some(gi) = self.lib.games.iter().position(|g| &g.id == id) else { continue };
-                rows.push(TexRow::Game(gi));
-                rows.extend(packs.iter().map(|&p| TexRow::Pack(gi, p)));
+                let enabled =
+                    packs.iter().filter(|&&pi| self.tex.pack(pi).and_then(|p| self.tex.installed.get(&p.key)).is_some_and(|i| i.enabled)).count();
+                rows.push(TexRow::Game { game: gi, packs: packs.len(), enabled });
+                if self.tex.expanded.contains(id) {
+                    rows.extend(packs.iter().map(|&p| TexRow::Pack(gi, p)));
+                }
             }
         }
         rows
@@ -144,7 +214,7 @@ impl App {
     fn tex_key(&self, r: &TexRow) -> Option<TexKey> {
         Some(match r {
             TexRow::System { system, .. } => TexKey::System(system),
-            TexRow::Game(g) => TexKey::Game(self.lib.games[*g].id.clone()),
+            TexRow::Game { game, .. } => TexKey::Game(self.lib.games[*game].id.clone()),
             TexRow::Pack(g, p) => TexKey::Pack(self.lib.games[*g].id.clone(), self.tex.pack(*p)?.key.clone()),
         })
     }
@@ -168,6 +238,23 @@ impl App {
         self.tex.cursor = Some(keys[(cur + delta).clamp(0, keys.len() as isize - 1) as usize].clone());
     }
 
+    /// Collapse or expand a system, moving the cursor to its header when collapsing.
+    pub(super) fn tex_set_collapsed(&mut self, system: &'static str, collapse: bool) {
+        if collapse {
+            self.tex.collapsed.insert(system);
+            self.tex.cursor = Some(TexKey::System(system));
+        } else {
+            self.tex.collapsed.remove(&system);
+        }
+    }
+
+    /// Left/Right: collapse or expand the system under the cursor (only on a header row).
+    pub(super) fn tex_fold_here(&mut self, collapse: bool) {
+        if let Some(TexKey::System(system)) = self.tex.cursor.clone() {
+            self.tex_set_collapsed(system, collapse);
+        }
+    }
+
     /// The pack under the cursor, and the game it's shown under.
     fn tex_selected_pack(&self) -> Option<(String, Pack)> {
         let Some(TexKey::Pack(game, key)) = &self.tex.cursor else { return None };
@@ -175,9 +262,22 @@ impl App {
         Some((game.clone(), p.clone()))
     }
 
-    /// Enter: install a pack (its default build), or turn an installed one on/off. Packs
-    /// only on a web page open in the browser.
+    /// Enter: toggle a system's games or a game's packs; on a pack, install it (its default
+    /// build) or turn an installed one on/off. Packs only on a web page open in the browser.
     pub(super) fn tex_activate(&mut self) {
+        match self.tex.cursor.clone() {
+            Some(TexKey::System(system)) => {
+                let collapse = !self.tex.collapsed.contains(system);
+                return self.tex_set_collapsed(system, collapse);
+            }
+            Some(TexKey::Game(id)) => {
+                if !self.tex.expanded.remove(&id) {
+                    self.tex.expanded.insert(id);
+                }
+                return;
+            }
+            _ => {}
+        }
         let Some((_, p)) = self.tex_selected_pack() else { return self.tex_item_menu() };
         if let Some(s) = self.tex.jobs.get(&p.key)
             && !matches!(s, TexState::Failed(_))

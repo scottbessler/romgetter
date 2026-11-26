@@ -130,7 +130,7 @@ fn pad_help(app: &App) -> &'static str {
     match app.tab {
         Tab::Search => "[A] add / pick a source · [B] actions · [X] search · ←→ fold · [Y] menu · LB/RB tabs · LT/RT page",
         Tab::Library => "[A] download/open · [B] actions · [X] filter · [Y] menu · ←→ fold · LB/RB tabs · LT/RT page",
-        Tab::Textures => "[A] install / turn on·off · [B] actions · [Y] menu · LB/RB tabs · LT/RT page",
+        Tab::Textures => "[A] open game / install · ←→ fold · [B] actions · [Y] menu · LB/RB tabs · LT/RT page",
         Tab::Sources => "[A] open / actions · [B] actions (on/off) · ←→ fold · [Y] menu · LB/RB tabs · LT/RT page",
         Tab::Config => "[A] change / switch · [B] actions · [Y] menu · LB/RB tabs · LT/RT page",
     }
@@ -400,8 +400,13 @@ fn game_status(app: &App, id: &str) -> (String, Color, String) {
     }
     let local_only = id.starts_with("local:");
     if app.needs_key.contains(id) {
+        let packer = app.lib.get(id).and_then(|g| crate::compress::usable(&g.system));
         return match app.local.get(id) {
+            Some(LocalState::Failed(m)) if packer.is_some() => ("✗ failed".into(), Color::Red, m.clone()),
             Some(LocalState::Failed(m)) => ("✗ no key".into(), Color::Red, m.clone()),
+            _ if let Some(t) = packer => {
+                ("◐ pack".into(), Color::Yellow, format!("Enter packs it as {}: smaller, and it plays without unzipping", t.format()))
+            }
             _ if app.lib.get(id).is_some_and(|g| g.system == "xbox360") => {
                 ("◐ zipped".into(), Color::Yellow, "Xenia needs the ISO · Enter unzips it".into())
             }
@@ -612,13 +617,36 @@ fn draw_textures(f: &mut Frame, app: &mut App, area: Rect) {
     let items: Vec<ListItem> = rows
         .iter()
         .map(|r| match r {
-            TexRow::System { system, with_packs, on_disk } => ListItem::new(Line::from(vec![
-                Span::styled(format!("▾ {}", systems::label(system)), Style::new().fg(Color::Magenta).bold()),
-                Span::styled(format!("  {with_packs} of {on_disk} games on disk have texture packs"), DIM),
-            ])),
-            TexRow::Game(g) => {
-                let g = &app.lib.games[*g];
-                ListItem::new(Line::from(vec![Span::raw("  "), Span::styled(app.game_name(g), Style::new().bold())]))
+            TexRow::System { system, with_packs, on_disk, packs, collapsed } => {
+                let arrow = if *collapsed { "▸" } else { "▾" };
+                ListItem::new(Line::from(vec![
+                    Span::styled(format!("{arrow} {}", systems::label(system)), Style::new().fg(Color::Magenta).bold()),
+                    Span::styled(
+                        format!("  {with_packs} of {on_disk} on disk · {packs} pack{}", if *packs == 1 { "" } else { "s" }),
+                        DIM,
+                    ),
+                ]))
+            }
+            TexRow::Game { game, packs, enabled } => {
+                let g = &app.lib.games[*game];
+                let expanded = app.tex.expanded.contains(&g.id);
+                let arrow = if *packs == 0 {
+                    " "
+                } else if expanded {
+                    "▾"
+                } else {
+                    "▸"
+                };
+                let mut spans = vec![
+                    Span::raw("  "),
+                    Span::styled(format!("{arrow} "), Style::new().fg(Color::Cyan)),
+                    Span::styled(app.game_name(g), Style::new().bold()),
+                ];
+                if *enabled > 0 {
+                    spans.push(Span::styled(format!("  ● {enabled} on"), Style::new().fg(Color::Green).bold()));
+                }
+                spans.push(Span::styled(format!("  {packs} pack{}", if *packs == 1 { "" } else { "s" }), DIM));
+                ListItem::new(Line::from(spans))
             }
             TexRow::Pack(_, p) => {
                 let Some(p) = app.tex.pack(*p) else { return ListItem::new("") };
@@ -669,7 +697,7 @@ fn draw_textures(f: &mut Frame, app: &mut App, area: Rect) {
         let msg = if app.tex.loading {
             "Fetching the texture pack lists…"
         } else {
-            "No texture packs for the GameCube or N64 games on disk (yet). r refreshes the lists."
+            "No texture packs for the games on disk (yet). r refreshes the lists."
         };
         f.render_widget(Paragraph::new(msg).style(DIM).centered(), mid);
     }

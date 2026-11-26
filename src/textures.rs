@@ -1,12 +1,14 @@
 //! Texture packs for the GameCube (Dolphin) and N64 (RetroArch's Mupen64Plus-Next) games on disk.
 //!
-//! The catalog merges three lists, deduped by game and author:
+//! The catalog merges four lists, deduped by game and author:
 //! - EmulationKing (GameCube and N64 pages, files on its own server),
 //! - rapka's dolphin-textures list (MEGA links, keyed by disc ID),
-//! - putachi's free GameCube list (Google Drive, MEGA, MediaFire, … or a forum/Patreon page).
+//! - putachi's free GameCube list (Google Drive, MEGA, MediaFire, … or a forum/Patreon page),
+//! - the "Texture Packs Archive" Google Sheet (GBAtemp threads, TeraBox mirrors, GhostlyDark's
+//!   evilgames.eu files for N64).
 //!
 //! File hosts (MEGA, Google Drive, MediaFire, Dropbox) go through TorBox first, then
-//! Real-Debrid; plain file servers (EmulationKing's), which neither takes, download directly.
+//! Real-Debrid; plain file servers (EmulationKing's, evilgames.eu), which neither takes, download directly.
 //! Pages only a person can use (Patreon, Gumroad, forums) open in a browser.
 //!
 //! Installed packs live in `texture_packs/romgetter/<pack>/<folder>`; enabling one moves its
@@ -33,6 +35,22 @@ const EK: &str = "https://emulationking.com";
 const EK_LISTS: [(&str, &str); 2] = [("gc", "/nintendo/gamecube/texturepacks/index.md"), ("n64", "/nintendo/n64/texturepacks/index.md")];
 const RAPKA: &str = "https://raw.githubusercontent.com/rapka/dolphin-textures/master/PACKS.md";
 const PUTACHI: &str = "https://putachi.net/ultimate-gamecube-hd-texture-pack-list/";
+/// The "Texture Packs Archive" Google Sheet (a tab per console), as an .xlsx: CSV exports lose
+/// the links, which are cell hyperlinks behind "Link".
+const SHEET: &str = "https://docs.google.com/spreadsheets/d/1sif8FeRGJRbytK8wFRXgF6Hke9V6GUFs";
+// The tab name in the sheet → the folder name the library uses for the system (`systems.rs`).
+const SHEET_TABS: [(&str, &str); 10] = [
+    ("GC", "gc"),
+    ("N64", "n64"),
+    ("PS2", "ps2"),
+    ("PSOne", "psx"),
+    ("Wii", "wii"),
+    ("Dreamcast", "dreamcast"),
+    ("PSP", "psp"),
+    ("PS Vita", "psvita"),
+    ("3DS", "n3ds"),
+    ("Switch", "switch"),
+];
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Build {
@@ -58,7 +76,7 @@ pub struct Pack {
     #[serde(default)]
     pub page: Option<String>,
     pub builds: Vec<Build>,
-    /// Lists it came from ("EmulationKing", "rapka", "putachi").
+    /// Lists it came from ("EmulationKing", "rapka", "putachi", "sheet").
     pub sources: Vec<String>,
     /// EmulationKing's name for the game in its URLs ("zeldaocarinaoftime"): cleaner than
     /// the pack titles, which are free-form ("CBFD", "Djipis 2009 Cellshade Ocarina of Time").
@@ -96,6 +114,7 @@ pub fn reach(url: &str) -> Reach {
     let host = url.split("://").nth(1).unwrap_or(url).split('/').next().unwrap_or("").trim_start_matches("www.").to_lowercase();
     match host.as_str() {
         "files.emulationking.com" => Reach::Direct,
+        "evilgames.eu" if url.contains("/files/") => Reach::Direct,
         "mega.nz" | "mega.co.nz" | "mediafire.com" | "drive.google.com" | "docs.google.com" | "dropbox.com" => Reach::Debrid,
         _ => Reach::Browser,
     }
@@ -134,7 +153,7 @@ pub struct Catalog {
 }
 
 fn catalog_path(cache_dir: &Path) -> PathBuf {
-    cache_dir.join("texture-packs.v3.json") // v3: descriptions
+    cache_dir.join("texture-packs.v5.json") // v5: sheet tabs beyond GC/N64 (PS2, Dreamcast, …)
 }
 
 pub fn load_catalog(cache_dir: &Path) -> Option<Catalog> {
@@ -184,6 +203,9 @@ pub async fn fetch_catalog(http: &reqwest::Client) -> Result<Catalog> {
     }
     if let Ok(html) = get_text(http, PUTACHI).await {
         packs.extend(parse_putachi(&html));
+    }
+    if let Ok(sheet) = fetch_sheet(http).await {
+        packs.extend(sheet);
     }
     Ok(Catalog { fetched: crate::library::now_secs(), packs: merge(packs) })
 }
@@ -383,6 +405,201 @@ fn parse_putachi(html: &str) -> Vec<Pack> {
         packs.push(p);
     }
     packs
+}
+
+/// The sheet's GameCube and N64 tabs. GhostlyDark's evilgames.eu pages it links to are
+/// fetched too, for their files (the sheet only has the page).
+async fn fetch_sheet(http: &reqwest::Client) -> Result<Vec<Pack>> {
+    let xlsx = http.get(format!("{SHEET}/export?format=xlsx")).send().await?.error_for_status()?.bytes().await?;
+    let mut packs = parse_sheet(&xlsx)?;
+    for p in &mut packs {
+        let Some(page) = p.page.clone().filter(|u| u.contains("evilgames.eu/texture-packs/")) else { continue };
+        if let Ok(html) = get_text(http, &page).await {
+            let files = parse_evilgames(&page, &html);
+            if !files.is_empty() {
+                p.builds = files;
+            }
+        }
+    }
+    Ok(packs)
+}
+
+/// A worksheet's cells by reference ("C2" → text) and its hyperlinks ("C2" → URL).
+type Cells = (HashMap<String, String>, HashMap<String, String>);
+
+/// Read the tabs named in `SHEET_TABS` out of an .xlsx: text from the shared strings, links
+/// from each sheet's hyperlink relationships.
+fn read_xlsx(bytes: &[u8]) -> Result<Vec<(&'static str, Cells)>> {
+    let mut z = zip::ZipArchive::new(std::io::Cursor::new(bytes)).context("not an .xlsx")?;
+    let mut file = |name: &str| -> Result<String> {
+        let mut s = String::new();
+        z.by_name(name).with_context(|| format!("{name} missing"))?.read_to_string(&mut s)?;
+        Ok(s)
+    };
+    let tags = |xml: &str, tag: &str| -> Vec<String> {
+        xml.split(&format!("<{tag} ")).skip(1).map(|t| format!(" {}", t.split('>').next().unwrap_or(""))).collect()
+    };
+    let strings: Vec<String> = file("xl/sharedStrings.xml")?
+        .split("<si>")
+        .skip(1)
+        .map(|si| {
+            let si = si.split("</si>").next().unwrap_or(si);
+            // rich text has several runs: <r><t>a</t></r><r><t xml:space="preserve">b</t></r>
+            si.split("<t").skip(1).filter_map(|t| t.split_once('>')).map(|(_, r)| unescape(r.split("</t>").next().unwrap_or(""))).collect()
+        })
+        .collect();
+    let workbook = file("xl/workbook.xml")?;
+    let wb_rels = file("xl/_rels/workbook.xml.rels")?;
+    let target = |rels: &str, id: &str| {
+        tags(rels, "Relationship").into_iter().find(|t| attr(t, "Id").as_deref() == Some(id)).and_then(|t| attr(&t, "Target"))
+    };
+    let mut out = Vec::new();
+    for (tab, system) in SHEET_TABS {
+        let Some(sheet) = tags(&workbook, "sheet").into_iter().find(|t| attr(t, "name").map(|n| unescape(&n)).as_deref() == Some(tab)) else {
+            continue;
+        };
+        let Some(path) = attr(&sheet, "r:id").and_then(|id| target(&wb_rels, &id)) else { continue };
+        let path = format!("xl/{}", path.trim_start_matches("/xl/"));
+        let xml = file(&path)?;
+        let (dir, name) = path.rsplit_once('/').unwrap_or(("xl", &path));
+        let rels = file(&format!("{dir}/_rels/{name}.rels")).unwrap_or_default();
+        let mut text = HashMap::new();
+        for c in xml.split("<c ").skip(1) {
+            let (tag, body) = c.split_once('>').unwrap_or((c, ""));
+            let Some(r) = attr(&format!(" {tag}"), "r") else { continue };
+            if tag.ends_with('/') {
+                continue;
+            }
+            let body = body.split("</c>").next().unwrap_or(body);
+            let v = body.split_once("<v>").and_then(|(_, v)| v.split("</v>").next()).unwrap_or("");
+            let t = if attr(&format!(" {tag}"), "t").as_deref() == Some("s") {
+                v.parse::<usize>().ok().and_then(|i| strings.get(i)).cloned().unwrap_or_default()
+            } else if let Some((_, is)) = body.split_once("<is>") {
+                is.split("<t").skip(1).filter_map(|t| t.split_once('>')).map(|(_, r)| unescape(r.split("</t>").next().unwrap_or(""))).collect()
+            } else {
+                unescape(v)
+            };
+            text.insert(r, t.trim().to_string());
+        }
+        let links = tags(&xml, "hyperlink")
+            .iter()
+            .filter_map(|h| Some((attr(h, "ref")?, unescape(&target(&rels, &attr(h, "r:id")?)?))))
+            .collect();
+        out.push((system, (text, links)));
+    }
+    Ok(out)
+}
+
+/// The sheet's rows: one pack per row, its download and mirror links as builds. Packs the
+/// other lists already have (EmulationKing) and the N64 tab's PC/PlayStation mods (ModDB)
+/// are left out. Paid packs keep only the page where they're sold, not a mirror of them.
+fn parse_sheet(bytes: &[u8]) -> Result<Vec<Pack>> {
+    let mut packs = Vec::new();
+    for (system, (text, links)) in read_xlsx(bytes)? {
+        let cell = |col: &str, row: u32| text.get(&format!("{col}{row}")).map(String::as_str).filter(|s| !s.is_empty() && *s != "N/A");
+        let link = |col: &str, row: u32| links.get(&format!("{col}{row}")).filter(|u| u.starts_with("http")).cloned();
+        // columns by heading, from the row that has "Game Title"
+        let Some(head) = (1..20).find(|&r| ('A'..='Z').any(|c| cell(&c.to_string(), r) == Some("Game Title")))
+        else {
+            continue;
+        };
+        let col = |name: &str| ('A'..='Z').map(|c| c.to_string()).find(|c| cell(c, head).is_some_and(|h| h.eq_ignore_ascii_case(name)));
+        let (Some(title), Some(dl)) = (col("Game Title"), col("Download")) else { continue };
+        let [mirror, region, serial, size, restriction, status, kind, author, tip] =
+            ["Mirror Download", "Region", "Serial Number", "Size", "Restriction", "Status", "Type", "Pack Author", "Tip the Author"].map(col);
+        let get = |c: &Option<String>, r: u32| c.as_deref().and_then(|c| cell(c, r));
+        let last = text.keys().filter_map(|k| k.trim_start_matches(|c: char| c.is_ascii_alphabetic()).parse::<u32>().ok()).max().unwrap_or(0);
+        for r in head + 1..=last {
+            let Some(game) = cell(&title, r) else { continue };
+            let Some(main) = link(&dl, r) else { continue };
+            if main.contains("emulationking.com") || main.contains("moddb.com") {
+                continue;
+            }
+            let paid = get(&restriction, r).is_some_and(|x| x.to_lowercase().contains("paywall") || x.to_lowercase().contains("patreon"));
+            let bytes = get(&size, r).and_then(|s| parse_size(&s.replace(',', "."))).unwrap_or(0);
+            let mut urls = vec![main.clone()];
+            if paid {
+                // the sale page: the download cell when it's one, else the author's tip page
+                if reach(&main) != Reach::Browser {
+                    urls = tip.as_deref().and_then(|c| link(c, r)).into_iter().collect();
+                }
+            } else {
+                urls.extend(mirror.as_deref().and_then(|c| link(c, r)));
+            }
+            let builds: Vec<Build> = urls.into_iter().map(|url| Build { label: host_label(&url, paid), url, size: bytes }).collect();
+            if builds.is_empty() {
+                continue;
+            }
+            let author = get(&author, r).unwrap_or("");
+            let id = get(&serial, r).map(str::to_uppercase).filter(|s| system == "gc" && is_disc_id(s));
+            let page = (reach(&main) == Reach::Browser).then(|| main.clone());
+            let mut p = new_pack(system, game, author, id, page, builds, "sheet");
+            p.region = get(&region, r).map(str::to_string);
+            p.status = get(&status, r).map(|s| s.replace('-', " "));
+            let style = match get(&kind, r).unwrap_or("").to_lowercase().as_str() {
+                "ai upscale" => "The game's own textures upscaled by AI, not redrawn by hand.",
+                "handcrafted" => "Redrawn by hand.",
+                "port" => "Ported from another version of the game.",
+                _ => "",
+            };
+            p.summary = if paid { format!("Paid: sold on the author's page. {style}").trim().to_string() } else { style.into() };
+            packs.push(p);
+        }
+    }
+    Ok(packs)
+}
+
+/// What a link's build is called, after its host: "GBAtemp", "TeraBox", "MEGA", …
+fn host_label(url: &str, paid: bool) -> String {
+    let host = url.split("://").nth(1).unwrap_or(url).split('/').next().unwrap_or("").trim_start_matches("www.").to_lowercase();
+    let name = match host.as_str() {
+        "gbatemp.net" => "GBAtemp",
+        "mega.nz" | "mega.co.nz" => "MEGA",
+        "drive.google.com" | "docs.google.com" => "Google Drive",
+        "mediafire.com" => "MediaFire",
+        "patreon.com" => "Patreon",
+        "ko-fi.com" => "Ko-fi",
+        h if h.contains("terabox") => "TeraBox",
+        h => h.split('.').next().unwrap_or(h),
+    };
+    if paid { format!("{name} (paid)") } else { name.to_string() }
+}
+
+/// GhostlyDark's pack page: the files for GLideN64 (what Mupen64Plus-Next uses), HD before
+/// 4K and cache before folder. Builds for Dolphin (the Wii releases), RT64 or the PC ports
+/// (Ship of Harkinian, 2 Ship 2 Harkinian, …) are left out.
+fn parse_evilgames(page: &str, html: &str) -> Vec<Build> {
+    let base = page.rsplit_once("/texture-packs/").map_or(page, |(b, _)| b);
+    let mut builds: Vec<(u8, Build)> = Vec::new();
+    for href in html.split("href=\"../files/texture-packs/").skip(1).filter_map(|h| h.split('"').next()) {
+        let (stem, ext) = href.rsplit_once('.').unwrap_or((href, ""));
+        if !matches!(ext, "7z" | "zip") || href.contains("-combo-") {
+            continue;
+        }
+        // "oot-reloaded-v11.0.0-gliden64-hts-hd" → ["gliden64", "hts", "hd"] after the version
+        let Some((_, rest)) = stem.split_once("-v") else { continue };
+        let parts: Vec<&str> = rest.split('-').skip(1).collect();
+        let parts = parts.strip_prefix(&["gliden64"]).unwrap_or(&parts);
+        let (format, res) = match parts {
+            [f] => (*f, ""),
+            [f, r @ ("hd" | "4k")] => (*f, *r),
+            _ => continue,
+        };
+        let rank = match (format, res) {
+            ("hts", "hd" | "") => 0,
+            ("hts", _) => 1,
+            ("png", "hd" | "") => 2,
+            ("png", _) => 3,
+            _ => continue,
+        };
+        let label = format!("GLideN64 {}{}", format.to_uppercase(), if res.is_empty() { String::new() } else { format!(" {}", res.to_uppercase()) });
+        let url = format!("{base}/files/texture-packs/{href}");
+        if !builds.iter().any(|(_, b)| b.url == url) {
+            builds.push((rank, Build { label, url, size: 0 }));
+        }
+    }
+    builds.sort_by_key(|(r, _)| *r);
+    builds.into_iter().map(|(_, b)| b).collect()
 }
 
 fn text_of(html: &str) -> String {
@@ -1152,6 +1369,15 @@ mod tests {
         bk.slug = Some("banjokazooie".into());
         assert!(fits(&bk, "n64", "Banjo-Kazooie (USA).zip", None));
         assert!(!fits(&bk, "n64", "Banjo-Tooie (USA).zip", None));
+        // sheet packs for other consoles match by title; the system must match too
+        let ct = new_pack("ps2", "Crazy Taxi", "ryan1337", None, None, vec![], "sheet");
+        assert!(fits(&ct, "ps2", "Crazy Taxi (USA).chd", None));
+        assert!(!fits(&ct, "dreamcast", "Crazy Taxi (USA).chd", None));
+        let ctd = new_pack("dreamcast", "Crazy Taxi", "Bl4ckH4nd", None, None, vec![], "sheet");
+        assert!(fits(&ctd, "dreamcast", "Crazy Taxi (USA).chd", None));
+        let ctd2 = new_pack("dreamcast", "Crazy Taxi 2", "Bl4ckH4nd", None, None, vec![], "sheet");
+        assert!(fits(&ctd2, "dreamcast", "Crazy Taxi 2 (USA).chd", None));
+        assert!(!fits(&ctd2, "dreamcast", "Crazy Taxi (USA).chd", None), "2 is not 1");
     }
 
     #[test]
@@ -1311,5 +1537,25 @@ mod tests {
         }
         assert!(by("EmulationKing") > 50);
         assert!(n(&|p| !p.about.is_empty()) > 50, "overviews parsed");
+    }
+
+    #[test]
+    fn parses_evilgames() {
+        // GhostlyDark's OoT "Reloaded" page: only GLideN64 files (what Mupen64Plus-Next uses)
+        let page = "https://evilgames.eu/texture-packs/oot-reloaded";
+        let html = r#"<html><body>
+<h2>GLideN64</h2><p>foo</p>
+<a href="../files/texture-packs/oot-reloaded-v11.0.0-gliden64-hts-hd.7z">x</a>
+<a href="../files/texture-packs/oot-reloaded-v11.0.0-gliden64-hts.7z">x</a>
+<a href="../files/texture-packs/oot-reloaded-v11.0.0-gliden64-png-4k.7z">x</a>
+<a href="../files/texture-packs/oot-reloaded-v11.0.0-rt64-hd.7z">x</a>
+<a href="../files/texture-packs/oot-reloaded-v11.0.0-gliden64-hts-hd-combo.7z">x</a>
+</body></html>"#;
+        let b = parse_evilgames(page, html);
+        assert_eq!(b.len(), 3, "GLideN64 files only; RT64 and combo left out");
+        assert_eq!(b[0].label, "GLideN64 HTS HD");
+        assert_eq!(b[0].url, "https://evilgames.eu/files/texture-packs/oot-reloaded-v11.0.0-gliden64-hts-hd.7z");
+        assert_eq!(b[1].label, "GLideN64 HTS");
+        assert_eq!(b[2].label, "GLideN64 PNG 4K");
     }
 }

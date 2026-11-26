@@ -21,7 +21,7 @@ use tokio::sync::{Semaphore, mpsc::UnboundedSender};
 mod settings;
 mod tex;
 pub use settings::{CfgAct, CfgRow, CfgTab, Field, tilde};
-pub use tex::{TexRow, TexTab};
+pub use tex::{TexKey, TexRow, TexTab};
 
 /// Re-index cached sets older than this (in the background; the cache stays usable).
 const REINDEX_AFTER: Duration = Duration::from_hours(336);
@@ -278,6 +278,8 @@ pub enum Act {
     ShowAll,
     Search,
     DownloadAll,
+    /// Library: pack every loose or zipped disc game as CHD / RVZ.
+    PackAll,
     Paste,
     Sort,
     CollapseAll,
@@ -1138,6 +1140,26 @@ impl App {
         };
         self.download_queue.extend(ready);
         self.pump_downloads();
+    }
+
+    /// Games on disk that `pack_all` would pack (CHD / RVZ tool installed, not busy).
+    fn packable(&self) -> Vec<Game> {
+        self.lib
+            .games
+            .iter()
+            .filter(|g| self.needs_key.contains(&g.id) && crate::compress::usable(&g.system).is_some())
+            .filter(|g| !matches!(self.local.get(&g.id), Some(LocalState::Downloading { .. })))
+            .cloned()
+            .collect()
+    }
+
+    /// Pack every such game; they take turns (one conversion at a time, see `compress`).
+    fn pack_all(&mut self) {
+        let games = self.packable();
+        self.status = format!("packing {} game(s) as CHD / RVZ, one at a time", games.len());
+        for g in games {
+            self.start_local(g, true);
+        }
     }
 
     fn pump_downloads(&mut self) {
@@ -3081,8 +3103,12 @@ impl App {
     fn download_selected(&mut self, direct: bool) {
         let Some(g) = self.selected_game().cloned() else { return };
         if self.needs_key.contains(&g.id) && !matches!(self.local.get(&g.id), Some(LocalState::Downloading { .. })) {
-            // Already on disk: just unzip and/or fetch the disc key, no game download.
-            self.status = format!("getting the disc key for {}…", g.name);
+            // Already on disk: just unpack / pack and/or fetch the disc key, no game download.
+            self.status = match crate::compress::usable(&g.system) {
+                Some(t) => format!("packing {} as {}…", g.name, t.format()),
+                None if g.system == "ps3" => format!("getting the disc key for {}…", g.name),
+                None => format!("unpacking {}…", g.name),
+            };
             self.start_local(g, true);
             return;
         }
@@ -3411,7 +3437,12 @@ impl App {
                     title = self.display_name(&g.system, &g.name);
                     let present = self.present.contains(&g.id);
                     if self.needs_key.contains(&g.id) {
-                        items.push(("Get the disc key".into(), Act::Download));
+                        let label = match crate::compress::usable(&g.system) {
+                            Some(t) => format!("Pack as {}", t.format()),
+                            None if g.system == "ps3" => "Get the disc key".into(),
+                            None => "Unpack for the emulator".into(),
+                        };
+                        items.push((label, Act::Download));
                     } else if !present && g.kind == SourceKind::Vimm {
                         items.push(("Open Vimm's page in a browser".into(), Act::Download));
                     } else if !present {
@@ -3444,6 +3475,10 @@ impl App {
             Tab::Library => {
                 items.push(("Filter…".into(), Act::Search));
                 items.push(("Download all ready".into(), Act::DownloadAll));
+                let packable = self.packable().len();
+                if packable > 0 {
+                    items.push((format!("Pack all as CHD / RVZ ({packable} games)"), Act::PackAll));
+                }
                 items.push(("Paste a link…".into(), Act::Paste));
                 items.push((
                     match self.lib_sort {
@@ -3570,6 +3605,7 @@ impl App {
                 gamepad::open_steam_keyboard();
             }
             Act::DownloadAll => self.download_all_ready(),
+            Act::PackAll => self.pack_all(),
             Act::Paste => {
                 self.lib_input = LibInput::Paste;
                 self.editing = true;
@@ -3694,6 +3730,11 @@ impl App {
                     }
                 }
                 (Tab::Textures, KeyCode::Char('r')) => self.tex_fetch(),
+                (Tab::Textures, KeyCode::Left | KeyCode::Char('h')) => self.tex_fold_here(true),
+                (Tab::Textures, KeyCode::Right | KeyCode::Char('l')) => self.tex_fold_here(false),
+                (Tab::Textures, KeyCode::Char(' ')) if matches!(self.tex.cursor, Some(TexKey::System(_) | TexKey::Game(_))) => {
+                    self.tex_activate();
+                }
                 (Tab::Library, KeyCode::Enter) => self.activate_row(),
                 (_, KeyCode::Char(' ')) => self.open_item_menu(),
                 (Tab::Library, KeyCode::Left | KeyCode::Char('h')) => {
@@ -4665,19 +4706,25 @@ mod tests {
         app.press(KeyCode::Char('3'));
         assert!(app.tab == Tab::Textures);
         assert!(!app.tex.loading, "a fresh cached list isn't fetched again");
-        let shape: Vec<String> = app
-            .tex_rows()
-            .iter()
-            .map(|r| match r {
-                TexRow::System { system, with_packs, on_disk } => format!("{system} {with_packs}/{on_disk}"),
-                TexRow::Game(g) => app.lib.games[*g].name.clone(),
-                TexRow::Pack(_, p) => app.tex.pack(*p).unwrap().author.clone(),
-            })
-            .collect();
-        assert_eq!(shape, ["gc 1/1", "Luigi's Mansion (USA).rvz", "coolhardy100", "someone", "n64 0/0"]);
+        // Packs are hidden until a game is chosen; the row says how many there are.
+        let shape = |app: &App| -> Vec<String> {
+            app.tex_rows()
+                .iter()
+                .map(|r| match r {
+                    TexRow::System { system, with_packs, on_disk, .. } => format!("{system} {with_packs}/{on_disk}"),
+                    TexRow::Game { game, packs, .. } => format!("{} {packs}", app.lib.games[*game].name),
+                    TexRow::Pack(_, p) => app.tex.pack(*p).unwrap().author.clone(),
+                })
+                .collect()
+        };
+        assert_eq!(shape(&app), ["gc 1/1", "Luigi's Mansion (USA).rvz 2", "n64 0/0"]);
+
+        // Enter on the game shows its packs.
+        app.press(KeyCode::Down);
+        app.press(KeyCode::Enter);
+        assert_eq!(shape(&app), ["gc 1/1", "Luigi's Mansion (USA).rvz 2", "coolhardy100", "someone", "n64 0/0"]);
 
         // the pack's menu offers its build; a web-only pack offers its page
-        app.press(KeyCode::Down);
         app.press(KeyCode::Down);
         app.press(KeyCode::Char(' '));
         let labels: Vec<String> = app.menu.as_ref().unwrap().items.iter().map(|i| i.0.clone()).collect();
@@ -4703,6 +4750,52 @@ mod tests {
         assert!(!d.live("gc").join("GLM").exists());
         assert!(store.join("tex1.png").exists());
         let _ = std::fs::remove_dir_all(&d.root);
+    }
+
+    #[tokio::test]
+    async fn textures_tab_shows_sheet_pack_for_a_downloaded_game() {
+        use crate::textures::{Build, Catalog, Pack};
+        // a Dreamcast game on disk, with a pack only the sheet lists (no EmulationKing page)
+        let mut gs = games("dreamcast", 1);
+        gs[0].name = "Crazy Taxi 2 (USA).chd".into();
+        let mut app = test_app(gs);
+        app.tex.dirs.retroarch_opts = None;
+        let file = app.lib.games[0].local_paths(&app.ctx.roms_dir)[0].clone();
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        std::fs::write(&file, b"x").unwrap();
+        app.refresh_presence();
+        let pack = Pack {
+            key: "dreamcast/crazy taxi 2/bl4ckh4nd".into(),
+            system: "dreamcast".into(),
+            game: "Crazy Taxi 2".into(),
+            author: "Bl4ckH4nd".into(),
+            builds: vec![Build { label: "Patreon (paid)".into(), url: "https://www.patreon.com/Bl4ckH4nd".into(), size: 0 }],
+            sources: vec!["sheet".into()],
+            page: Some("https://www.patreon.com/Bl4ckH4nd".into()),
+            ..Pack::default()
+        };
+        crate::textures::save_catalog(&app.cache_dir, &Catalog { fetched: library::now_secs(), packs: vec![pack] }).unwrap();
+
+        app.press(KeyCode::Char('3'));
+        let shape: Vec<String> = app
+            .tex_rows()
+            .iter()
+            .map(|r| match r {
+                TexRow::System { system, with_packs, .. } => format!("{system} {with_packs}"),
+                TexRow::Game { game, packs, .. } => format!("{} {packs}", app.lib.games[*game].name),
+                TexRow::Pack(_, p) => app.tex.pack(*p).unwrap().author.clone(),
+            })
+            .collect();
+        // the game row shows how many packs fit; the packs stay hidden until it's chosen
+        assert_eq!(shape, ["gc 0", "n64 0", "dreamcast 1", "Crazy Taxi 2 (USA).chd 1"]);
+
+        // choosing the game shows the pack
+        app.press(KeyCode::Down); // n64 header
+        app.press(KeyCode::Down); // dreamcast header
+        app.press(KeyCode::Down); // the game
+        app.press(KeyCode::Enter);
+        assert!(app.tex_rows().iter().any(|r| matches!(r, TexRow::Pack(..))), "{:?}", app.tex_rows().len());
+        let _ = std::fs::remove_dir_all(app.ctx.roms_dir.parent().unwrap());
     }
 
     #[tokio::test]
